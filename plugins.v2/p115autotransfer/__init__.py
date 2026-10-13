@@ -34,11 +34,12 @@ from p115client.tool.life import BEHAVIOR_TYPE_TO_NAME, iter_life_behavior_once
 
 from app.chain.transfer import TransferChain
 from app.core.config import settings
+from app.core.context import MediaInfo, TorrentInfo
 from app.core.event import Event, eventmanager
 from app.log import logger
 from app.plugins import _PluginBase
-from app.schemas import FileItem, NotificationType
-from app.schemas.types import EventType
+from app.schemas import FileItem, NotificationType, TransferInfo
+from app.schemas.types import EventType, MediaType
 
 
 class P115AutoTransfer(_PluginBase):
@@ -49,7 +50,7 @@ class P115AutoTransfer(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/115.png"
     # 插件版本
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     # 插件作者
     plugin_author = "local"
     # 作者主页
@@ -74,6 +75,8 @@ class P115AutoTransfer(_PluginBase):
     _scanned_dirs: Dict[str, float] = {}
     # 已提交的离线任务 hash -> 提交时间（用于超时告警）
     _offline_tasks: Dict[str, float] = {}
+    # 整理后待复查的源目录路径 -> 首次登记时间（用于延迟复查空目录）
+    _pending_cleanup: Dict[str, float] = {}
 
     def __init__(self):
         super().__init__()
@@ -93,6 +96,13 @@ class P115AutoTransfer(_PluginBase):
         self._magnet_target_dir: str = "/影视库/小姐姐们"
         self._magnet_cron: str = "*/2 * * * *"
         self._magnet_timeout_min: int = 180
+        # 整理后清理空目录
+        self._cleanup_empty_after_transfer: bool = True
+        self._cleanup_delay_min: int = 3
+        # 成人内容入库（绕过 MP 识别，直接按番号入库）
+        self._adult_enabled: bool = True
+        self._adult_library_dir: str = "/影视库/小姐姐们"
+        self._adult_media_server: str = ""
 
     # ------------------------------------------------------------------ #
     # 生命周期
@@ -118,6 +128,13 @@ class P115AutoTransfer(_PluginBase):
             self._magnet_target_dir = (config.get("magnet_target_dir") or "/影视库/小姐姐们").strip()
             self._magnet_cron = config.get("magnet_cron") or "*/2 * * * *"
             self._magnet_timeout_min = int(config.get("magnet_timeout_min") or 180)
+            # 整理后清理空目录
+            self._cleanup_empty_after_transfer = config.get("cleanup_empty_after_transfer", True)
+            self._cleanup_delay_min = int(config.get("cleanup_delay_min") or 3)
+            # 成人内容入库
+            self._adult_enabled = config.get("adult_enabled", True)
+            self._adult_library_dir = (config.get("adult_library_dir") or "/影视库/小姐姐们").strip()
+            self._adult_media_server = (config.get("adult_media_server") or "").strip()
 
         # 先停掉旧任务
         self.stop_service()
@@ -469,6 +486,118 @@ class P115AutoTransfer(_PluginBase):
                             }
                         ],
                     },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VDivider",
+                                        "props": {"class": "my-4"},
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VAlert",
+                                        "props": {
+                                            "type": "info",
+                                            "variant": "tonal",
+                                            "text": "整理后清理空目录：整理完成后延迟复查源目录，若目录内已无任何文件（只剩空文件夹），则删除该目录。",
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "cleanup_empty_after_transfer",
+                                            "label": "整理后清理空目录",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "cleanup_delay_min",
+                                            "label": "复查延迟(分钟)",
+                                            "placeholder": "3",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "adult_enabled",
+                                            "label": "成人内容直接入库",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "adult_library_dir",
+                                            "label": "成人内容库目录",
+                                            "placeholder": "/影视库/小姐姐们",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "adult_media_server",
+                                            "label": "媒体服务器(可空)",
+                                            "placeholder": "留空则使用默认媒体服务器",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
                 ],
             }
         ], {
@@ -486,6 +615,11 @@ class P115AutoTransfer(_PluginBase):
             "magnet_target_dir": self._magnet_target_dir,
             "magnet_cron": self._magnet_cron,
             "magnet_timeout_min": self._magnet_timeout_min,
+            "cleanup_empty_after_transfer": self._cleanup_empty_after_transfer,
+            "cleanup_delay_min": self._cleanup_delay_min,
+            "adult_enabled": self._adult_enabled,
+            "adult_library_dir": self._adult_library_dir,
+            "adult_media_server": self._adult_media_server,
         }
 
     def get_page(self) -> Optional[List[dict]]:
@@ -546,6 +680,17 @@ class P115AutoTransfer(_PluginBase):
                     "name": "115磁力离线任务监控",
                     "trigger": CronTrigger.from_crontab(self._magnet_cron),
                     "func": self.check_offline_tasks,
+                    "kwargs": {},
+                }
+            )
+        # 整理后空目录复查
+        if self._cleanup_empty_after_transfer:
+            services.append(
+                {
+                    "id": "P115AutoTransfer_cleanup",
+                    "name": "115整理后空目录清理",
+                    "trigger": CronTrigger.from_crontab("* * * * *"),
+                    "func": self.check_pending_cleanup,
                     "kwargs": {},
                 }
             )
@@ -818,6 +963,16 @@ class P115AutoTransfer(_PluginBase):
 
             # 清理离线目录下遗留空目录
             self._cleanup_empty_dirs(pan)
+            # 登记源目录复查（正片已移走，若只剩空文件夹则删除）
+            self._schedule_cleanup(src_path)
+
+            # 成人内容：直接入库（绕过 MP 识别），并触发媒体服务器扫描
+            library_path = final_path
+            if self._adult_enabled:
+                try:
+                    library_path = self._adult_library_transfer(pan, main, main_name, ext)
+                except Exception as e:
+                    logger.error(f"【磁力离线】成人内容入库失败: {e}", exc_info=True)
 
             if self._notify:
                 self.post_message(
@@ -826,7 +981,7 @@ class P115AutoTransfer(_PluginBase):
                     text=(
                         f"正片：{main_name}\n"
                         f"大小：{size_mb} MB\n"
-                        f"路径：{final_path}\n"
+                        f"路径：{library_path}\n"
                         f"已删除推广/多余文件：{deleted} 个"
                     ),
                 )
@@ -837,6 +992,72 @@ class P115AutoTransfer(_PluginBase):
                 title="【磁力离线】",
                 text=f"整理失败：{name}\n{e}",
             )
+
+    def _adult_library_transfer(self, pan, main: FileItem, main_name: str, ext: str) -> str:
+        """成人内容直接入库：移动到媒体库目录并触发媒体服务器扫描。
+
+        不走 MP 识别/整理（成人内容识别会失败），直接按番号建目录移动文件。
+        返回最终入库路径。
+        """
+        lib_root_path = (self._adult_library_dir or "/影视库/小姐姐们").rstrip("/")
+        lib_root = pan.get_item(Path(lib_root_path))
+        if not lib_root:
+            logger.error(f"【磁力离线】成人库目录不存在：{lib_root_path}")
+            return main.path
+
+        # 目标子目录 <番号>
+        target_dir = pan.get_item(Path(f"{lib_root_path}/{main_name}"))
+        if not target_dir:
+            target_dir = pan.create_folder(lib_root, main_name)
+        if not target_dir:
+            logger.error(f"【磁力离线】创建成人库子目录失败：{main_name}")
+            return main.path
+
+        new_file_name = f"{main_name}{ext}"
+        if not pan.move(main, Path(target_dir.path), new_file_name):
+            logger.error(f"【磁力离线】成人内容移动失败：{main.path} -> {target_dir.path}")
+            return main.path
+
+        final_path = f"{target_dir.path.rstrip('/')}/{new_file_name}"
+        logger.info(f"【磁力离线】成人内容已入库：{final_path}")
+
+        # 触发媒体服务器扫描
+        self._refresh_media_server(lib_root_path)
+        return final_path
+
+    def _refresh_media_server(self, path: str):
+        """触发媒体服务器扫描指定路径（失败不影响主流程）"""
+        try:
+            from app.helper.mediaserver import MediaServerHelper
+            from app.schemas.mediaserver import RefreshMediaItem
+
+            name_filters = [self._adult_media_server] if self._adult_media_server else None
+            services = MediaServerHelper().get_services(name_filters=name_filters)
+            if not services:
+                logger.info("【磁力离线】未获取到媒体服务器实例，跳过扫描")
+                return
+            item = RefreshMediaItem(
+                title=Path(path).name,
+                type=MediaType.UNKNOWN,
+                target_path=Path(path),
+            )
+            for name, service in services.items():
+                try:
+                    if service.instance.is_inactive():
+                        logger.warning(f"【磁力离线】媒体服务器 {name} 未连接，跳过")
+                        continue
+                    if hasattr(service.instance, "refresh_library_by_items"):
+                        service.instance.refresh_library_by_items([item])
+                    elif hasattr(service.instance, "refresh_root_library"):
+                        service.instance.refresh_root_library()
+                    else:
+                        logger.warning(f"【磁力离线】{name} 不支持刷新")
+                        continue
+                    logger.info(f"【磁力离线】已触发 {name} 扫描：{path}")
+                except Exception as e:
+                    logger.warning(f"【磁力离线】触发 {name} 扫描失败: {e}")
+        except Exception as e:
+            logger.warning(f"【磁力离线】媒体服务器扫描调用失败: {e}")
 
     def _collect_files(self, pan, dir_item: FileItem) -> List[FileItem]:
         """递归收集目录下所有文件"""
@@ -873,6 +1094,59 @@ class P115AutoTransfer(_PluginBase):
                     logger.info(f"【磁力离线】已删除空目录：{child.path}")
             except Exception as e:
                 logger.warning(f"【磁力离线】删除空目录失败 {child.path}: {e}")
+
+    # ------------------------------------------------------------------ #
+    # 整理后空目录清理
+    # ------------------------------------------------------------------ #
+    def _schedule_cleanup(self, path: str):
+        """整理完成后登记源目录，延迟复查是否可删除"""
+        if not self._cleanup_empty_after_transfer or not path:
+            return
+        try:
+            self._pending_cleanup[path] = time()
+            logger.info(f"【网盘整理】已登记空目录复查：{path}")
+        except Exception as e:
+            logger.warning(f"【网盘整理】登记空目录复查失败 {path}: {e}")
+
+    def check_pending_cleanup(self):
+        """定时复查：整理后源目录若已无文件（只剩空文件夹）则删除"""
+        if not self._enabled or not self._cleanup_empty_after_transfer:
+            return
+        if not self._pending_cleanup:
+            return
+        if not self._ensure_client():
+            return
+        now = time()
+        delay_sec = max(0, self._cleanup_delay_min) * 60
+        for path, ts in list(self._pending_cleanup.items()):
+            if now - ts < delay_sec:
+                continue
+            try:
+                self._cleanup_source_dir(path)
+            except Exception as e:
+                logger.warning(f"【网盘整理】复查空目录失败 {path}: {e}")
+            finally:
+                self._pending_cleanup.pop(path, None)
+
+    def _cleanup_source_dir(self, path: str):
+        """若目录内已无任何文件（只剩空文件夹），删除该目录"""
+        from app.modules.filemanager.storages.u115 import U115Pan
+
+        pan = U115Pan()
+        item = pan.get_item(Path(path))
+        if not item:
+            logger.info(f"【网盘整理】源目录已不存在，跳过：{path}")
+            return
+        if item.type != "dir":
+            return
+        files = self._collect_files(pan, item)
+        if files:
+            logger.info(f"【网盘整理】源目录仍有 {len(files)} 个文件，保留：{path}")
+            return
+        if pan.delete(item):
+            logger.info(f"【网盘整理】已删除整理后空目录：{path}")
+        else:
+            logger.warning(f"【网盘整理】删除空目录失败：{path}")
 
     def _is_task_processed(self, info_hash: str) -> bool:
         if not info_hash:
@@ -1047,6 +1321,8 @@ class P115AutoTransfer(_PluginBase):
                 logger.info(f"【网盘整理】{file_path} 加入整理队列")
             except Exception as e:
                 logger.error(f"【网盘整理】处理文件失败: {e}", exc_info=True)
+        if count:
+            self._schedule_cleanup(path)
         if count and self._notify:
             self.post_message(
                 mtype=NotificationType.Plugin,
