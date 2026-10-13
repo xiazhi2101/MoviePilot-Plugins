@@ -3,14 +3,15 @@
     "name": "115网盘自动整理",
     "description": "监听 115 网盘目录（生活事件实时监听 / 定时轮询可切换），命中媒体文件后调用 MoviePilot 整理规则自动入库。支持 /p115_transfer 手动整理；支持 /ol 磁力离线下载并自动整理入库。",
     "labels": "网盘整理",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/115.png",
     "author": "local",
     "level": 1,
     "system_version": ">=2.12.0",
     "history": {
       "v1.0.0": "初始版本：从 P115StrmHelper 抽取网盘整理能力，支持事件监听/轮询切换与手动整理命令",
-      "v1.1.0": "新增磁力离线自动整理：/ol 提交 115 离线下载，定时轮询完成后只保留正片、清理推广文件并移动到目标目录"
+      "v1.1.0": "新增磁力离线自动整理：/ol 提交 115 离线下载，定时轮询完成后只保留正片、清理推广文件并移动到目标目录",
+      "v1.2.0": "修复媒体服务器刷新调用；新增整理后空目录清理与成人内容直接入库；补充 requirements.txt 依赖声明"
     }
   }
 }
