@@ -50,7 +50,7 @@ class P115AutoTransfer(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/115.png"
     # 插件版本
-    plugin_version = "1.2.0"
+    plugin_version = "1.6.0"
     # 插件作者
     plugin_author = "local"
     # 作者主页
@@ -77,18 +77,31 @@ class P115AutoTransfer(_PluginBase):
     _offline_tasks: Dict[str, float] = {}
     # 整理后待复查的源目录路径 -> 首次登记时间（用于延迟复查空目录）
     _pending_cleanup: Dict[str, float] = {}
+    # 目录事件待整理队列：目录路径 -> 登记时间（目录刚建时内部文件可能尚未落盘，需延迟复查）
+    # 目录事件待整理队列：目录路径 -> (首次登记时间, 上次复查时间)
+    _pending_folders: Dict[str, tuple] = {}
 
     def __init__(self):
         super().__init__()
         self._enabled: bool = False
         self._notify: bool = False
+        # 过程通知开关（默认关闭）：仅控制"开始整理/已提交 N 个文件/已提交离线"
+        # 这类过程反馈；整理完成、任务失败、离线完成等结果与异常通知不受影响。
+        self._notify_progress: bool = False
         self._cookies: Optional[str] = None
         self._storage: str = "u115"
         self._trigger_mode: str = "life"  # life / poll
         self._transfer_paths: Optional[str] = None
         self._poll_cron: str = "*/5 * * * *"
         self._min_file_size: int = 0  # MB
-        self._event_modes: List[str] = ["upload_file", "receive_files", "move_file"]
+        # 默认纳入 new_folder：分享转存/整包转存常只产生目录事件，不补会导致漏整理
+        self._event_modes: List[str] = ["upload_file", "receive_files", "move_file", "new_folder"]
+        # 目录事件实时整理：目录事件到达即扫描，内部文件未落盘时按短间隔快速重试
+        self._folder_delay_sec: int = 0
+        # 空目录快速重试间隔（秒），配合 1 分钟定时任务实现准实时
+        self._folder_retry_sec: int = 5
+        # 目录事件延迟复查最大轮次，超出后不再重复登记
+        self._folder_max_retry: int = 24
         self._last_error: Optional[str] = None
         # 磁力离线自动整理
         self._magnet_enabled: bool = True
@@ -111,6 +124,7 @@ class P115AutoTransfer(_PluginBase):
         if config:
             self._enabled = config.get("enabled", False)
             self._notify = config.get("notify", False)
+            self._notify_progress = config.get("notify_progress", False)
             self._cookies = config.get("cookies") or None
             self._storage = config.get("storage") or "u115"
             self._trigger_mode = config.get("trigger_mode") or "life"
@@ -122,6 +136,10 @@ class P115AutoTransfer(_PluginBase):
                 self._event_modes = modes
             elif isinstance(modes, str) and modes.strip():
                 self._event_modes = [m.strip() for m in modes.split(",") if m.strip()]
+            # 目录事件实时整理参数
+            self._folder_delay_sec = int(config.get("folder_delay_sec") or 0)
+            self._folder_retry_sec = int(config.get("folder_retry_sec") or 5)
+            self._folder_max_retry = int(config.get("folder_max_retry") or 24)
             # 磁力离线
             self._magnet_enabled = config.get("magnet_enabled", True)
             self._magnet_offline_dir = (config.get("magnet_offline_dir") or "/云下载").strip()
@@ -210,6 +228,20 @@ class P115AutoTransfer(_PluginBase):
                                         "props": {
                                             "model": "notify",
                                             "label": "发送通知",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "notify_progress",
+                                            "label": "过程通知",
+                                            "hint": "开启后额外发送「开始整理 / 已提交 N 个文件 / 已提交离线」等过程反馈",
                                         },
                                     }
                                 ],
@@ -357,6 +389,10 @@ class P115AutoTransfer(_PluginBase):
                                                 {
                                                     "title": "移动文件/目录",
                                                     "value": "move_file",
+                                                },
+                                                {
+                                                    "title": "新建目录（整包转存）",
+                                                    "value": "new_folder",
                                                 },
                                                 {
                                                     "title": "复制文件",
@@ -550,6 +586,36 @@ class P115AutoTransfer(_PluginBase):
                                     }
                                 ],
                             },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "folder_retry_sec",
+                                            "label": "空目录重试间隔(秒)",
+                                            "placeholder": "5",
+                                            "hint": "目录事件到达时若内部文件未落盘，按此间隔快速重试",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "folder_max_retry",
+                                            "label": "空目录最大重试次数",
+                                            "placeholder": "24",
+                                            "hint": "重试间隔 × 次数 为总等待上限",
+                                        },
+                                    }
+                                ],
+                            },
                         ],
                     },
                     {
@@ -603,6 +669,7 @@ class P115AutoTransfer(_PluginBase):
         ], {
             "enabled": self._enabled,
             "notify": self._notify,
+            "notify_progress": self._notify_progress,
             "cookies": self._cookies,
             "storage": self._storage,
             "trigger_mode": self._trigger_mode,
@@ -610,6 +677,9 @@ class P115AutoTransfer(_PluginBase):
             "poll_cron": self._poll_cron,
             "min_file_size": self._min_file_size,
             "event_modes": self._event_modes,
+            "folder_delay_sec": self._folder_delay_sec,
+            "folder_retry_sec": self._folder_retry_sec,
+            "folder_max_retry": self._folder_max_retry,
             "magnet_enabled": self._magnet_enabled,
             "magnet_offline_dir": self._magnet_offline_dir,
             "magnet_target_dir": self._magnet_target_dir,
@@ -694,6 +764,17 @@ class P115AutoTransfer(_PluginBase):
                     "kwargs": {},
                 }
             )
+        # 目录事件快速重试（目录刚建时内部文件可能尚未落盘）
+        if self._trigger_mode == "life" and "new_folder" in self._event_modes:
+            services.append(
+                {
+                    "id": "P115AutoTransfer_folder",
+                    "name": "115目录事件快速整理",
+                    "trigger": CronTrigger.from_crontab("*/1 * * * *"),
+                    "func": self.check_pending_folders,
+                    "kwargs": {},
+                }
+            )
         return services
 
     # ------------------------------------------------------------------ #
@@ -721,11 +802,12 @@ class P115AutoTransfer(_PluginBase):
             return
         if not self._ensure_client():
             return
-        self.post_message(
-            mtype=NotificationType.Plugin,
-            title="【网盘整理】",
-            text=f"开始手动整理：{arg_str}",
-        )
+        if self._notify_progress:
+            self.post_message(
+                mtype=NotificationType.Plugin,
+                title="【网盘整理】",
+                text=f"开始手动整理：{arg_str}",
+            )
         Thread(
             target=self.transfer_path,
             args=(arg_str,),
@@ -799,6 +881,7 @@ class P115AutoTransfer(_PluginBase):
             if info_hash:
                 self._offline_tasks[str(info_hash).lower()] = time()
             logger.info(f"【磁力离线】已提交离线任务 hash={info_hash} -> {self._magnet_offline_dir}")
+            # /ol 属用户主动发起的单次操作，其过程与结果通知一律保留
             self.post_message(
                 mtype=NotificationType.Plugin,
                 title="【磁力离线】",
@@ -974,17 +1057,17 @@ class P115AutoTransfer(_PluginBase):
                 except Exception as e:
                     logger.error(f"【磁力离线】成人内容入库失败: {e}", exc_info=True)
 
-            if self._notify:
-                self.post_message(
-                    mtype=NotificationType.Plugin,
-                    title="【磁力离线】整理完成",
-                    text=(
-                        f"正片：{main_name}\n"
-                        f"大小：{size_mb} MB\n"
-                        f"路径：{library_path}\n"
-                        f"已删除推广/多余文件：{deleted} 个"
-                    ),
-                )
+            # /ol 属用户主动发起的单次操作，整理完成通知始终发送
+            self.post_message(
+                mtype=NotificationType.Plugin,
+                title="【磁力离线】整理完成",
+                text=(
+                    f"正片：{main_name}\n"
+                    f"大小：{size_mb} MB\n"
+                    f"路径：{library_path}\n"
+                    f"已删除推广/多余文件：{deleted} 个"
+                ),
+            )
         except Exception as e:
             logger.error(f"【磁力离线】整理失败: {e}", exc_info=True)
             self.post_message(
@@ -1107,6 +1190,89 @@ class P115AutoTransfer(_PluginBase):
             logger.info(f"【网盘整理】已登记空目录复查：{path}")
         except Exception as e:
             logger.warning(f"【网盘整理】登记空目录复查失败 {path}: {e}")
+
+    def _schedule_folder(self, folder_path: Path):
+        """登记目录到快速重试队列（内部文件尚未落盘时使用）"""
+        key = str(folder_path)
+        if key in self._pending_folders:
+            return
+        # 结构：(首次登记时间, 上次复查时间)
+        self._pending_folders[key] = (time(), 0.0)
+        logger.info(f"【网盘整理】目录暂为空，登记快速重试：{key}")
+
+    def _count_folder_media(self, cid: int) -> int:
+        """统计目录下直属媒体文件数量（不递归、不遍历全盘）。
+
+        115 原生 fs_files 返回字段：n=名称，fc=1 文件 / 0 目录。
+        """
+        count = 0
+        try:
+            resp = self._client.fs_files({"cid": int(cid), "show_dir": 1, "limit": 1000, "offset": 0})
+            data = resp.get("data") or []
+            for item in data:
+                try:
+                    if int(item.get("fc") or 0) == 0:
+                        # 目录项跳过
+                        continue
+                except (TypeError, ValueError):
+                    continue
+                name = str(item.get("n") or "")
+                if not name:
+                    continue
+                if self._is_media_file(Path(name)):
+                    count += 1
+        except Exception as e:
+            logger.warning(f"【网盘整理】统计目录媒体文件失败 cid={cid}: {e}")
+        return count
+
+    def _try_transfer_folder(self, cid: int, folder_path: Path):
+        """目录已落盘则整理，否则登记快速重试。"""
+        if not self._client:
+            return
+        try:
+            if self._count_folder_media(int(cid)) > 0:
+                self._transfer_folder(int(cid), folder_path)
+                self._pending_folders.pop(str(folder_path), None)
+            else:
+                self._schedule_folder(folder_path)
+        except Exception as e:
+            logger.error(f"【网盘整理】尝试整理目录失败 {folder_path}: {e}", exc_info=True)
+            self._schedule_folder(folder_path)
+
+    def check_pending_folders(self):
+        """定时复查：目录内文件落盘后立即整理（短间隔快速重试）"""
+        if not self._enabled or not self._pending_folders:
+            return
+        if not self._ensure_client():
+            return
+        now = time()
+        interval = max(1, int(self._folder_retry_sec))
+        max_wait = interval * max(1, int(self._folder_max_retry))
+        for path, meta in list(self._pending_folders.items()):
+            first_seen, last_check = meta
+            if now - last_check < interval:
+                continue
+            waited = now - first_seen
+            if waited >= max_wait:
+                logger.warning(f"【网盘整理】目录等待 {int(waited)} 秒仍无媒体文件，停止跟踪：{path}")
+                self._pending_folders.pop(path, None)
+                continue
+            try:
+                cid = self._get_cid(path)
+                if cid is None or cid < 0:
+                    logger.warning(f"【网盘整理】待整理目录已不存在，停止跟踪：{path}")
+                    self._pending_folders.pop(path, None)
+                    continue
+                media_count = self._count_folder_media(int(cid))
+                if media_count > 0:
+                    logger.info(f"【网盘整理】目录已落盘 {media_count} 个媒体文件，开始整理：{path}")
+                    self._transfer_folder(int(cid), Path(path))
+                    self._pending_folders.pop(path, None)
+                else:
+                    self._pending_folders[path] = (first_seen, now)
+            except Exception as e:
+                logger.error(f"【网盘整理】复查待整理目录失败 {path}: {e}", exc_info=True)
+                self._pending_folders[path] = (first_seen, now)
 
     def check_pending_cleanup(self):
         """定时复查：整理后源目录若已无文件（只剩空文件夹）则删除"""
@@ -1246,8 +1412,9 @@ class P115AutoTransfer(_PluginBase):
         if not self._in_transfer_paths(file_path):
             return
         if file_category == 0:
-            # 目录：遍历其中媒体文件
-            self._transfer_folder(int(file_id), file_path)
+            # 目录：先立即扫一次（多数转存此时文件已落盘），
+            # 若仍是空目录则登记到快速重试队列，由分钟级定时任务补扫
+            self._try_transfer_folder(int(file_id), file_path)
         else:
             # 文件：直接整理
             self._transfer_single_file(event, file_path)
@@ -1323,7 +1490,7 @@ class P115AutoTransfer(_PluginBase):
                 logger.error(f"【网盘整理】处理文件失败: {e}", exc_info=True)
         if count:
             self._schedule_cleanup(path)
-        if count and self._notify:
+        if count and self._notify_progress:
             self.post_message(
                 mtype=NotificationType.Plugin,
                 title="【网盘整理】",
@@ -1362,7 +1529,7 @@ class P115AutoTransfer(_PluginBase):
                 logger.info(f"【网盘整理】{file_path} 加入整理队列")
             except Exception as e:
                 logger.error(f"【网盘整理】处理文件失败: {e}", exc_info=True)
-        if count and self._notify:
+        if count and self._notify_progress:
             self.post_message(
                 mtype=NotificationType.Plugin,
                 title="【网盘整理】",
@@ -1375,14 +1542,15 @@ class P115AutoTransfer(_PluginBase):
             return
         if self._min_file_size and (event.get("file_size") or 0) < self._min_file_size * 1024 * 1024:
             return
+        name, basename = self._inject_parent_media_id(file_path)
         fileitem = FileItem(
             storage=self._storage,
             fileid=str(event.get("file_id")),
             parent_fileid=str(event.get("parent_id")),
             path=file_path.as_posix(),
             type="file",
-            name=file_path.name,
-            basename=file_path.stem,
+            name=name,
+            basename=basename,
             extension=file_path.suffix[1:].lower(),
             size=event.get("file_size"),
             pickcode=event.get("pick_code"),
@@ -1395,19 +1563,64 @@ class P115AutoTransfer(_PluginBase):
     # 工具
     # ------------------------------------------------------------------ #
     def _build_fileitem(self, item: Dict[str, Any], file_path: Path) -> FileItem:
+        name, basename = self._inject_parent_media_id(file_path)
         return FileItem(
             storage=self._storage,
             fileid=str(item.get("id")),
             parent_fileid=str(item.get("parent_id")),
             path=file_path.as_posix(),
             type="file",
-            name=file_path.name,
-            basename=file_path.stem,
+            name=name,
+            basename=basename,
             extension=file_path.suffix[1:].lower(),
             size=item.get("size"),
             pickcode=item.get("pickcode"),
             modify_time=item.get("ctime") or item.get("user_ptime"),
         )
+
+    @staticmethod
+    def _extract_media_id_from_dir(dir_name: str) -> Optional[str]:
+        """从目录名提取 TMDB ID。
+
+        转存目录形如 ``片名 (年份) {tmdb-1785448}``，但文件名常常不含 ID，
+        导致 MP 仅凭文件名识别失败。这里把目录名里的 ID 提取出来复用。
+        支持 ``{tmdb-123}``、``{tmdbid-123}``、``[tmdb-123]``、``(tmdb-123)`` 等写法。
+        """
+        if not dir_name:
+            return None
+        for pattern in (
+            r"[{\[]\s*tmdb(?:id)?[=\-]\s*(\d+)\s*[}\]]",
+            r"\(\s*tmdb(?:id)?[=\-]\s*(\d+)\s*\)",
+        ):
+            m = re.search(pattern, dir_name, re.IGNORECASE)
+            if m:
+                return m.group(1)
+        return None
+
+    def _inject_parent_media_id(self, file_path: Path) -> Tuple[str, str]:
+        """若文件自身不含媒体 ID 而父目录含有，则把 ID 附加到名称上。
+
+        仅在文件名本身没有 tmdb 标记时注入，避免覆盖已有身份，
+        注入格式 ``{tmdbid-xxx}`` 为 MP 识别器明确支持的标签。
+        """
+        name = file_path.name
+        basename = file_path.stem
+        try:
+            # 文件名已带 ID 时不处理
+            if re.search(r"tmdb(?:id)?[=\-]\s*\d+", basename, re.IGNORECASE):
+                return name, basename
+            parent_name = file_path.parent.name if file_path.parent else ""
+            media_id = self._extract_media_id_from_dir(parent_name)
+            if not media_id:
+                return name, basename
+            new_basename = f"{basename}{{tmdbid-{media_id}}}"
+            logger.info(
+                f"【网盘整理】从父目录补全媒体 ID：{basename} -> {new_basename}"
+            )
+            return f"{new_basename}{file_path.suffix}", new_basename
+        except Exception as e:
+            logger.warning(f"【网盘整理】补全媒体 ID 失败 {file_path}: {e}")
+            return name, basename
 
     def _is_media_file(self, file_path: Path) -> bool:
         suffix = file_path.suffix.lower()
