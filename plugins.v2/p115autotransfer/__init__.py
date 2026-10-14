@@ -12,6 +12,7 @@
 
 磁力离线自动整理（成人内容专用流程）：
 - 命令 /ol <磁力链接>：提交 115 离线下载到 /云下载
+- 自动识别：直接发送整条为 magnet:/ed2k: 的消息即可提交（配置项 auto_magnet，默认开）
 - 定时轮询离线任务状态（clouddownload_task_list），完成后：
   * 只保留体积最大的视频文件（正片），删除其余全部文件
   * 移动到 /影视库/小姐姐们/<正片名>/<正片名>.<ext>
@@ -51,7 +52,7 @@ class P115AutoTransfer(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/115.png"
     # 插件版本
-    plugin_version = "1.8.0"
+    plugin_version = "1.9.0"
     # 插件作者
     plugin_author = "local"
     # 作者主页
@@ -110,6 +111,8 @@ class P115AutoTransfer(_PluginBase):
         self._magnet_target_dir: str = "/影视库/小姐姐们"
         # 手动整理命令的默认目录：菜单点击（无参数）时直接整理该目录
         self._manual_transfer_dir: str = "/最近接收"
+        # 自动识别磁力链接：整条消息以 magnet:/ed2k: 开头时自动提交离线下载
+        self._auto_magnet: bool = True
         self._magnet_cron: str = "*/2 * * * *"
         self._magnet_timeout_min: int = 180
         # 整理后清理空目录
@@ -148,6 +151,7 @@ class P115AutoTransfer(_PluginBase):
             self._magnet_offline_dir = (config.get("magnet_offline_dir") or "/云下载").strip()
             self._magnet_target_dir = (config.get("magnet_target_dir") or "/影视库/小姐姐们").strip()
             self._manual_transfer_dir = (config.get("manual_transfer_dir") or "/最近接收").strip() or "/最近接收"
+            self._auto_magnet = bool(config.get("auto_magnet", True))
             self._magnet_cron = config.get("magnet_cron") or "*/2 * * * *"
             self._magnet_timeout_min = int(config.get("magnet_timeout_min") or 180)
             # 整理后清理空目录
@@ -468,6 +472,21 @@ class P115AutoTransfer(_PluginBase):
                                 "props": {"cols": 12, "md": 3},
                                 "content": [
                                     {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "auto_magnet",
+                                            "label": "自动识别磁力链接",
+                                            "hint": "开启后，直接发送整条为 magnet:/ed2k: 的消息即可自动提交离线，无需 /ol 前缀",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {
                                         "component": "VTextField",
                                         "props": {
                                             "model": "magnet_offline_dir",
@@ -736,6 +755,7 @@ class P115AutoTransfer(_PluginBase):
             "magnet_offline_dir": self._magnet_offline_dir,
             "magnet_target_dir": self._magnet_target_dir,
             "manual_transfer_dir": self._manual_transfer_dir,
+            "auto_magnet": self._auto_magnet,
             "magnet_cron": self._magnet_cron,
             "magnet_timeout_min": self._magnet_timeout_min,
             "cleanup_empty_after_transfer": self._cleanup_empty_after_transfer,
@@ -843,6 +863,31 @@ class P115AutoTransfer(_PluginBase):
             self._handle_manual_transfer(event_data)
         elif action == "p115_offline_magnet":
             self._handle_offline_magnet(event_data)
+
+    @eventmanager.register(EventType.UserMessage)
+    def on_user_message(self, event: Event = None):
+        """监听未被宿主命令消费的用户消息，自动识别整条为磁力/ed2k 链接的消息。
+
+        仅当整条消息（去除首尾空格）以 ``magnet:`` 或 ``ed2k:`` 开头时处理，
+        避免正文中偶然出现的链接造成误触发。可在插件配置中关闭该行为。
+        """
+        if not self._enabled or not self._auto_magnet or not self._magnet_enabled:
+            return
+        if not event or not event.event_data:
+            return
+        text = str(event.event_data.get("text") or "").strip()
+        if not text:
+            return
+        if not re.match(r"^(magnet:|ed2k:)", text, re.IGNORECASE):
+            return
+        logger.info("【磁力离线】检测到用户消息中的磁力/ed2k 链接，自动提交离线任务")
+        if not self._ensure_client():
+            return
+        Thread(
+            target=self.submit_offline,
+            args=(text,),
+            daemon=True,
+        ).start()
 
     def _handle_manual_transfer(self, event_data: dict):
         arg_str = (event_data.get("arg_str") or "").strip()
