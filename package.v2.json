@@ -3,7 +3,7 @@
     "name": "115网盘自动整理",
     "description": "监听 115 网盘目录（生活事件实时监听 / 定时轮询可切换），命中媒体文件后调用 MoviePilot 整理规则自动入库。支持 /p115_transfer 手动整理；支持 /ol 磁力离线下载并自动整理入库。",
     "labels": "网盘整理",
-    "version": "1.8.0",
+    "version": "1.9.0",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/115.png",
     "author": "local",
     "level": 1,
@@ -18,7 +18,8 @@
       "v1.6.0": "新增过程通知开关（默认关闭），静默转存整理过程反馈；/ol 磁力链路通知改为始终发送，不受开关影响",
       "v1.7.0": "插件通知不再附加插件页跳转链接，去除「点击查看」",
       "v1.7.1": "修复成人内容入库重复移动导致误报「移动失败」的问题",
-      "v1.8.0": "手动整理命令支持不带参数直接整理默认目录（新增配置项 manual_transfer_dir，默认 /最近接收）"
+      "v1.8.0": "手动整理命令支持不带参数直接整理默认目录（新增配置项 manual_transfer_dir，默认 /最近接收）",
+      "v1.9.0": "新增自动识别磁力链接：直接发送整条为 magnet:/ed2k: 的消息即可提交离线，无需 /ol 前缀（配置项 auto_magnet，默认开）"
     }
   },
   "AgentGlobalSwitch": {
