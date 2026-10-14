@@ -8,7 +8,7 @@
   * 定时轮询目录比对（无需生活事件，有延迟）
 - 命中整理目录下的媒体文件后，调用 MoviePilot 的 TransferChain.do_transfer()
   按 MP 的目录/重命名规则整理入库（不生成 STRM，不做媒体服务器刷新）。
-- 提供手动整理命令 /p115_transfer <路径>。
+- 提供手动整理命令 /p115_transfer <路径>；不带参数时整理默认目录（manual_transfer_dir，默认 /最近接收）。
 
 磁力离线自动整理（成人内容专用流程）：
 - 命令 /ol <磁力链接>：提交 115 离线下载到 /云下载
@@ -51,7 +51,7 @@ class P115AutoTransfer(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/115.png"
     # 插件版本
-    plugin_version = "1.7.1"
+    plugin_version = "1.8.0"
     # 插件作者
     plugin_author = "local"
     # 作者主页
@@ -108,6 +108,8 @@ class P115AutoTransfer(_PluginBase):
         self._magnet_enabled: bool = True
         self._magnet_offline_dir: str = "/云下载"
         self._magnet_target_dir: str = "/影视库/小姐姐们"
+        # 手动整理命令的默认目录：菜单点击（无参数）时直接整理该目录
+        self._manual_transfer_dir: str = "/最近接收"
         self._magnet_cron: str = "*/2 * * * *"
         self._magnet_timeout_min: int = 180
         # 整理后清理空目录
@@ -145,6 +147,7 @@ class P115AutoTransfer(_PluginBase):
             self._magnet_enabled = config.get("magnet_enabled", True)
             self._magnet_offline_dir = (config.get("magnet_offline_dir") or "/云下载").strip()
             self._magnet_target_dir = (config.get("magnet_target_dir") or "/影视库/小姐姐们").strip()
+            self._manual_transfer_dir = (config.get("manual_transfer_dir") or "/最近接收").strip() or "/最近接收"
             self._magnet_cron = config.get("magnet_cron") or "*/2 * * * *"
             self._magnet_timeout_min = int(config.get("magnet_timeout_min") or 180)
             # 整理后清理空目录
@@ -550,6 +553,54 @@ class P115AutoTransfer(_PluginBase):
                                         "props": {
                                             "type": "info",
                                             "variant": "tonal",
+                                            "text": "手动整理目录：菜单点击 /p115_transfer（不带参数）时直接整理该目录；带参数时仍按参数路径整理。",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "manual_transfer_dir",
+                                            "label": "手动整理默认目录",
+                                            "placeholder": "/最近接收",
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VDivider",
+                                        "props": {"class": "my-4"},
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VAlert",
+                                        "props": {
+                                            "type": "info",
+                                            "variant": "tonal",
                                             "text": "整理后清理空目录：整理完成后延迟复查源目录，若目录内已无任何文件（只剩空文件夹），则删除该目录。",
                                         },
                                     }
@@ -684,6 +735,7 @@ class P115AutoTransfer(_PluginBase):
             "magnet_enabled": self._magnet_enabled,
             "magnet_offline_dir": self._magnet_offline_dir,
             "magnet_target_dir": self._magnet_target_dir,
+            "manual_transfer_dir": self._manual_transfer_dir,
             "magnet_cron": self._magnet_cron,
             "magnet_timeout_min": self._magnet_timeout_min,
             "cleanup_empty_after_transfer": self._cleanup_empty_after_transfer,
@@ -702,7 +754,7 @@ class P115AutoTransfer(_PluginBase):
             {
                 "cmd": "/p115_transfer",
                 "event": EventType.PluginAction,
-                "desc": "手动整理 115 网盘指定目录",
+                "desc": "手动整理 115 网盘指定目录（不带参数则整理默认目录）",
                 "category": "网盘整理",
                 "data": {"action": "p115_manual_transfer"},
             },
@@ -795,11 +847,8 @@ class P115AutoTransfer(_PluginBase):
     def _handle_manual_transfer(self, event_data: dict):
         arg_str = (event_data.get("arg_str") or "").strip()
         if not arg_str:
-            self._send_notify(
-                title="【网盘整理】",
-                text="请提供要整理的 115 网盘目录，例如：/p115_transfer /最近接收",
-            )
-            return
+            # 菜单点击不带参数时，直接整理默认目录（配置项 manual_transfer_dir，默认 /最近接收）
+            arg_str = self._manual_transfer_dir or "/最近接收"
         if not self._ensure_client():
             return
         if self._notify_progress:
