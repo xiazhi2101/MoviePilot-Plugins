@@ -39,6 +39,7 @@ from app.core.event import Event, eventmanager
 from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas import FileItem, NotificationType, TransferInfo
+from app.schemas.message import Message
 from app.schemas.types import EventType, MediaType
 
 
@@ -50,7 +51,7 @@ class P115AutoTransfer(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/115.png"
     # 插件版本
-    plugin_version = "1.6.0"
+    plugin_version = "1.7.1"
     # 插件作者
     plugin_author = "local"
     # 作者主页
@@ -794,8 +795,7 @@ class P115AutoTransfer(_PluginBase):
     def _handle_manual_transfer(self, event_data: dict):
         arg_str = (event_data.get("arg_str") or "").strip()
         if not arg_str:
-            self.post_message(
-                mtype=NotificationType.Plugin,
+            self._send_notify(
                 title="【网盘整理】",
                 text="请提供要整理的 115 网盘目录，例如：/p115_transfer /最近接收",
             )
@@ -803,8 +803,7 @@ class P115AutoTransfer(_PluginBase):
         if not self._ensure_client():
             return
         if self._notify_progress:
-            self.post_message(
-                mtype=NotificationType.Plugin,
+            self._send_notify(
                 title="【网盘整理】",
                 text=f"开始手动整理：{arg_str}",
             )
@@ -817,15 +816,13 @@ class P115AutoTransfer(_PluginBase):
     def _handle_offline_magnet(self, event_data: dict):
         arg_str = (event_data.get("arg_str") or "").strip()
         if not arg_str:
-            self.post_message(
-                mtype=NotificationType.Plugin,
+            self._send_notify(
                 title="【磁力离线】",
                 text="请提供磁力链接，例如：/ol magnet:?xt=urn:btih:xxxx",
             )
             return
         if not self._magnet_enabled:
-            self.post_message(
-                mtype=NotificationType.Plugin,
+            self._send_notify(
                 title="【磁力离线】",
                 text="磁力离线整理功能未启用",
             )
@@ -838,12 +835,30 @@ class P115AutoTransfer(_PluginBase):
             daemon=True,
         ).start()
 
+    def _send_notify(self, title: str, text: str) -> None:
+        """发送插件通知，且不附加插件页跳转链接。
+
+        基类 ``post_message`` 在未传 link 时会自动补上
+        ``#/plugins?tab=installed&id=<类名>``，用户不需要这条「点击查看」，
+        因此这里直接走 chain 发送，显式将 link 置空。
+        """
+        try:
+            self.chain.post_message(
+                Message(
+                    mtype=NotificationType.Plugin,
+                    title=title,
+                    text=text,
+                    link=None,
+                )
+            )
+        except Exception as e:
+            logger.error(f"【网盘整理】发送通知失败：{e}")
+
     def _ensure_client(self) -> bool:
         if self._client:
             return True
         if not self._cookies:
-            self.post_message(
-                mtype=NotificationType.Plugin,
+            self._send_notify(
                 title="【网盘整理】",
                 text="未配置 115 Cookie，无法执行",
             )
@@ -858,8 +873,7 @@ class P115AutoTransfer(_PluginBase):
         """提交磁力链接到 115 离线下载"""
         magnet = magnet.strip().strip("<>")
         if not re.match(r"^(magnet:|ed2k:|https?://|ftp://)", magnet, re.IGNORECASE):
-            self.post_message(
-                mtype=NotificationType.Plugin,
+            self._send_notify(
                 title="【磁力离线】",
                 text=f"链接格式不支持：{magnet[:80]}",
             )
@@ -867,8 +881,7 @@ class P115AutoTransfer(_PluginBase):
         try:
             cid = self._get_cid(self._magnet_offline_dir)
             if cid is None or cid < 0:
-                self.post_message(
-                    mtype=NotificationType.Plugin,
+                self._send_notify(
                     title="【磁力离线】",
                     text=f"离线保存目录不存在：{self._magnet_offline_dir}",
                 )
@@ -882,15 +895,13 @@ class P115AutoTransfer(_PluginBase):
                 self._offline_tasks[str(info_hash).lower()] = time()
             logger.info(f"【磁力离线】已提交离线任务 hash={info_hash} -> {self._magnet_offline_dir}")
             # /ol 属用户主动发起的单次操作，其过程与结果通知一律保留
-            self.post_message(
-                mtype=NotificationType.Plugin,
+            self._send_notify(
                 title="【磁力离线】",
                 text=f"已提交离线下载\n保存目录：{self._magnet_offline_dir}\n完成后将自动整理正片",
             )
         except Exception as e:
             logger.error(f"【磁力离线】提交失败: {e}", exc_info=True)
-            self.post_message(
-                mtype=NotificationType.Plugin,
+            self._send_notify(
                 title="【磁力离线】",
                 text=f"提交离线失败：{e}",
             )
@@ -934,8 +945,7 @@ class P115AutoTransfer(_PluginBase):
                         continue
                     self._mark_task_processed(info_hash)
                     self._offline_tasks.pop(info_hash, None)
-                    self.post_message(
-                        mtype=NotificationType.Plugin,
+                    self._send_notify(
                         title="【磁力离线】",
                         text=f"离线任务失败：{name}\n状态：{task.get('status_text') or status}",
                     )
@@ -944,8 +954,7 @@ class P115AutoTransfer(_PluginBase):
                     elapsed = (now - self._offline_tasks[info_hash]) / 60
                     if elapsed >= self._magnet_timeout_min:
                         self._offline_tasks.pop(info_hash, None)
-                        self.post_message(
-                            mtype=NotificationType.Plugin,
+                        self._send_notify(
                             title="【磁力离线】",
                             text=f"离线任务长时间未完成（{int(elapsed)} 分钟）：{name}\n进度：{task.get('display_percent')}%",
                         )
@@ -971,8 +980,7 @@ class P115AutoTransfer(_PluginBase):
             src_item = pan.get_item(Path(src_path))
             if not src_item:
                 logger.warning(f"【磁力离线】源路径不存在：{src_path}")
-                self.post_message(
-                    mtype=NotificationType.Plugin,
+                self._send_notify(
                     title="【磁力离线】",
                     text=f"离线已完成但未找到文件：{src_path}",
                 )
@@ -1011,8 +1019,7 @@ class P115AutoTransfer(_PluginBase):
             target_root = pan.get_item(Path(self._magnet_target_dir))
             if not target_root:
                 logger.error(f"【磁力离线】目标目录不存在：{self._magnet_target_dir}")
-                self.post_message(
-                    mtype=NotificationType.Plugin,
+                self._send_notify(
                     title="【磁力离线】",
                     text=f"目标目录不存在：{self._magnet_target_dir}",
                 )
@@ -1033,8 +1040,7 @@ class P115AutoTransfer(_PluginBase):
             ok = pan.move(main, Path(sub_dir.path), new_file_name)
             if not ok:
                 logger.error(f"【磁力离线】移动正片失败：{main.path} -> {sub_dir.path}")
-                self.post_message(
-                    mtype=NotificationType.Plugin,
+                self._send_notify(
                     title="【磁力离线】",
                     text=f"移动正片失败：{main.name}",
                 )
@@ -1058,8 +1064,7 @@ class P115AutoTransfer(_PluginBase):
                     logger.error(f"【磁力离线】成人内容入库失败: {e}", exc_info=True)
 
             # /ol 属用户主动发起的单次操作，整理完成通知始终发送
-            self.post_message(
-                mtype=NotificationType.Plugin,
+            self._send_notify(
                 title="【磁力离线】整理完成",
                 text=(
                     f"正片：{main_name}\n"
@@ -1070,17 +1075,17 @@ class P115AutoTransfer(_PluginBase):
             )
         except Exception as e:
             logger.error(f"【磁力离线】整理失败: {e}", exc_info=True)
-            self.post_message(
-                mtype=NotificationType.Plugin,
+            self._send_notify(
                 title="【磁力离线】",
                 text=f"整理失败：{name}\n{e}",
             )
 
     def _adult_library_transfer(self, pan, main: FileItem, main_name: str, ext: str) -> str:
-        """成人内容直接入库：移动到媒体库目录并触发媒体服务器扫描。
+        """成人内容入库收尾：确认目录并触发媒体服务器扫描。
 
-        不走 MP 识别/整理（成人内容识别会失败），直接按番号建目录移动文件。
-        返回最终入库路径。
+        不走 MP 识别/整理（成人内容识别会失败）。注意正片已在调用方移动到
+        ``<成人库目录>/<番号>/``，此处**不可再次移动**——重复移动会因源文件
+        已不在原路径而误报「移动失败」。这里只负责目录校验与刷新媒体服务器。
         """
         lib_root_path = (self._adult_library_dir or "/影视库/小姐姐们").rstrip("/")
         lib_root = pan.get_item(Path(lib_root_path))
@@ -1097,10 +1102,6 @@ class P115AutoTransfer(_PluginBase):
             return main.path
 
         new_file_name = f"{main_name}{ext}"
-        if not pan.move(main, Path(target_dir.path), new_file_name):
-            logger.error(f"【磁力离线】成人内容移动失败：{main.path} -> {target_dir.path}")
-            return main.path
-
         final_path = f"{target_dir.path.rstrip('/')}/{new_file_name}"
         logger.info(f"【磁力离线】成人内容已入库：{final_path}")
 
@@ -1491,8 +1492,7 @@ class P115AutoTransfer(_PluginBase):
         if count:
             self._schedule_cleanup(path)
         if count and self._notify_progress:
-            self.post_message(
-                mtype=NotificationType.Plugin,
+            self._send_notify(
                 title="【网盘整理】",
                 text=f"{path} 已提交 {count} 个文件整理",
             )
@@ -1530,8 +1530,7 @@ class P115AutoTransfer(_PluginBase):
             except Exception as e:
                 logger.error(f"【网盘整理】处理文件失败: {e}", exc_info=True)
         if count and self._notify_progress:
-            self.post_message(
-                mtype=NotificationType.Plugin,
+            self._send_notify(
                 title="【网盘整理】",
                 text=f"{folder_path} 已提交 {count} 个文件整理",
             )
