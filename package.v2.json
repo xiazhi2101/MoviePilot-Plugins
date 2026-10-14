@@ -20,5 +20,20 @@
       "v1.7.1": "修复成人内容入库重复移动导致误报「移动失败」的问题",
       "v1.8.0": "手动整理命令支持不带参数直接整理默认目录（新增配置项 manual_transfer_dir，默认 /最近接收）"
     }
+  },
+  "AgentGlobalSwitch": {
+    "name": "全局智能助手开关",
+    "description": "提供一键命令，切换 MoviePilot 的全局 AI 智能体开关（AI_AGENT_GLOBAL），并回复当前状态。",
+    "labels": "智能体",
+    "version": "1.0.2",
+    "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/agent.png",
+    "author": "local",
+    "level": 1,
+    "system_version": ">=3.0.0",
+    "history": {
+      "v1.0.0": "初始版本：一键切换全局 AI 智能体开关并回复当前状态",
+      "v1.0.1": "命令名由 /ai 改为 /agent，避免与内置 /ai 强制走 Agent 前缀冲突",
+      "v1.0.2": "精简切换成功通知，仅保留「全局 AI 智能体：已开启/已关闭」一行"
+    }
   }
 }
