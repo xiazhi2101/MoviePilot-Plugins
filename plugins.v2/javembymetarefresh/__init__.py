@@ -4,10 +4,12 @@ import pickle
 import re
 import threading
 import time
+import traceback
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import pytz
+import requests
 from app import schemas
 from app.chain.tmdb import TmdbChain
 from app.db.oper.transferhistory import TransferHistoryOper
@@ -36,7 +38,7 @@ class JavEmbyMetaRefresh(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/thsrite/MoviePilot-Plugins/main/icons/emby-icon.png"
     # 插件版本
-    plugin_version = "1.2.0"
+    plugin_version = "1.3.2"
     # 插件作者
     plugin_author = "local"
     # 作者主页
@@ -384,6 +386,7 @@ class JavEmbyMetaRefresh(_PluginBase):
                                 }
                     except Exception as e:
                         logger.error(f"刷新媒体库元数据失败：{str(e)}")
+                        logger.error(f"异常堆栈：{traceback.format_exc()}")
                         continue
 
                 # 处理剧集
@@ -496,6 +499,42 @@ class JavEmbyMetaRefresh(_PluginBase):
                     return f"{match.group(1).upper()}-{match.group(2)}"
         return None
 
+    def __cache_get_text(self, key: str) -> Optional[str]:
+        """从维基缓存读取文本，未命中返回 None。
+
+        FileCache 是二进制缓存，因此统一用 pickle 序列化以兼容 str 值。
+
+        :param key: 缓存键
+        :return: 缓存文本；键不存在返回 None
+        """
+        try:
+            raw = self._wiki_cache.get(key)
+        except Exception as err:
+            logger.debug(f"读取维基缓存失败：{err}")
+            return None
+        if raw is None:
+            return None
+        if isinstance(raw, bytes):
+            try:
+                return pickle.loads(raw)
+            except Exception:
+                try:
+                    return raw.decode("utf-8")
+                except Exception:
+                    return None
+        return str(raw)
+
+    def __cache_set_text(self, key: str, value: str) -> None:
+        """把文本写入维基缓存（pickle 序列化为二进制）。
+
+        :param key: 缓存键
+        :param value: 待写入文本
+        """
+        try:
+            self._wiki_cache.set(key, pickle.dumps(value))
+        except Exception as err:
+            logger.debug(f"写入维基缓存失败：{err}")
+
     def __get_wiki_chinese_name(self, jp_name: str) -> Optional[str]:
         """用日文演员名在中文维基百科反查中文名。
 
@@ -508,7 +547,7 @@ class JavEmbyMetaRefresh(_PluginBase):
         if not self._wiki_enabled or not jp_name:
             return None
         cache_key = f"wiki::{jp_name}"
-        cached = self._wiki_cache.get(cache_key)
+        cached = self.__cache_get_text(cache_key)
         if cached is not None:
             return cached or None
         try:
@@ -543,9 +582,9 @@ class JavEmbyMetaRefresh(_PluginBase):
             if not title:
                 continue
             if self.__title_matches_actor(title, jp_name):
-                self._wiki_cache.set(cache_key, title)
+                self.__cache_set_text(cache_key, title)
                 return title
-        self._wiki_cache.set(cache_key, "")
+        self.__cache_set_text(cache_key, "")
         return None
 
     @staticmethod
@@ -580,7 +619,7 @@ class JavEmbyMetaRefresh(_PluginBase):
         if not self._wiki_avatar or not title:
             return None
         cache_key = f"wiki-avatar::{title}"
-        cached = self._wiki_cache.get(cache_key)
+        cached = self.__cache_get_text(cache_key)
         if cached is not None:
             return cached or None
         try:
@@ -598,7 +637,10 @@ class JavEmbyMetaRefresh(_PluginBase):
                     "action": "query",
                     "titles": title,
                     "prop": "pageimages",
-                    "piprop": "original",
+                    # 使用官方缩略图而非原图：维基原图常有数 MB，
+                    # 经代理下载易超时失败；缩略图约 60KB，稳定且足够做头像。
+                    "piprop": "thumbnail",
+                    "pithumbsize": 500,
                     "format": "json",
                     "redirects": 1,
                 },
@@ -611,14 +653,60 @@ class JavEmbyMetaRefresh(_PluginBase):
             return None
         pages = (payload.get("query") or {}).get("pages") or {}
         for _, page in pages.items():
-            source = ((page.get("original") or {}).get("source") or "").strip()
+            source = ((page.get("thumbnail") or {}).get("source") or "").strip()
             if source.startswith("http"):
                 # 去掉维基 API 附加的追踪参数
                 source = source.split("?")[0]
-                self._wiki_cache.set(cache_key, source)
+                self.__cache_set_text(cache_key, source)
                 return source
-        self._wiki_cache.set(cache_key, "")
+        self.__cache_set_text(cache_key, "")
         return None
+
+    @staticmethod
+    def __has_kana(text: str) -> bool:
+        """判断名称是否含日文假名（平假名/片假名）。
+
+        含假名说明该名称仍是日文原名、未被本地化为中文名，
+        此时才允许启用单演员番号兜底匹配。
+
+        :param text: 演员名
+        :return: 含假名返回 True
+        """
+        if not text:
+            return False
+        return any(
+            "\u3040" <= ch <= "\u309f" or "\u30a0" <= ch <= "\u30ff"
+            for ch in str(text)
+        )
+
+    @staticmethod
+    def __normalize_actor_name(text: str) -> str:
+        """把演员名归一到可比较形式，用于跨简繁/异体字匹配。
+
+        日文汉字与中文简体常有差异（如 ``亜``/``亞`` → ``亚``），
+        Emby 中演员名多为简体，而 JavBus 返回日文汉字，直接比较会失配。
+
+        :param text: 原始演员名
+        :return: 归一化后的名称（去空白、转小写）
+        """
+        if not text:
+            return ""
+        mapping = {
+            "亜": "亚", "亞": "亚", "愛": "爱", "惡": "恶", "壓": "压", "圍": "围",
+            "榮": "荣", "繪": "绘", "緣": "缘", "應": "应", "歐": "欧", "廣": "广",
+            "歸": "归", "藝": "艺", "兒": "儿", "濟": "济", "齊": "齐", "氣": "气",
+            "區": "区", "樂": "乐", "禮": "礼", "龍": "龙", "樓": "楼", "瀧": "泷",
+            "惱": "恼", "內": "内", "靜": "静", "姫": "姬", "葉": "叶", "櫻": "樱",
+            "澤": "泽", "鶴": "鹤", "樹": "树", "對": "对", "瀨": "濑", "鷺": "鹭",
+            "寧": "宁", "橫": "横", "邊": "边", "鳳": "凤", "實": "实", "壽": "寿",
+            "雙": "双", "體": "体", "帶": "带", "驛": "驿", "鹽": "盐", "豫": "预",
+            "圓": "圆", "戰": "战", "島": "岛", "晝": "昼", "條": "条", "張": "张",
+            "徵": "征", "藥": "药", "讀": "读", "灣": "湾", "顯": "显", "劍": "剑",
+            "宮": "宫", "峯": "峰", "醫": "医", "釋": "释", "靑": "青", "戶": "户",
+            "郞": "郎", "萬": "万", "與": "与", "爾": "尔", "種": "种", "價": "价",
+            "發": "发", "變": "变", "衆": "众", "淚": "泪", "點": "点", "劍": "剑",
+        }
+        return "".join(mapping.get(ch, ch) for ch in str(text)).strip().lower()
 
     def __get_javbus_actors(self, code: str) -> List[str]:
         """按番号从 JavBus 抓取演员原名列表。
@@ -746,17 +834,39 @@ class JavEmbyMetaRefresh(_PluginBase):
             name = str(people.get("Name") or "").strip()
             if not name:
                 continue
-            # 仅处理 JavBus 命中的演员，避免误改无关人物
+            # 仅处理演员条目：Emby 中同一媒体下还包含导演、制作公司、系列等
+            # 非演员人物（如「キョウセイ」「星シュート」），改动它们属于误改。
+            if str(people.get("Type") or "").strip().lower() != "actor":
+                continue
+            # 匹配 JavBus 演员：先精确比对，再做简繁/异体字归一比对
+            norm_name = self.__normalize_actor_name(name)
             matched = next(
                 (actor for actor in actors
                  if actor == name or actor.lower() == name.lower()),
                 None,
             )
             if not matched:
-                continue
+                matched = next(
+                    (actor for actor in actors
+                     if self.__normalize_actor_name(actor) == norm_name),
+                    None,
+                )
+            if not matched:
+                # 单演员番号兜底：番号下只有一位演员且演员条目未匹配时，
+                # 仅在名称含假名（说明是日文原名而非已本地化的中文名）时采用，
+                # 覆盖改艺名等无法靠字符归一命中的情况，同时避免误改。
+                actor_names = [a for a in actors if a]
+                if len(actor_names) == 1 and self.__has_kana(name):
+                    matched = actor_names[0]
+                    logger.info(
+                        f"番号 {code} 仅一位演员且当前名为日文假名，按兜底匹配：{name} -> {matched}"
+                    )
+                else:
+                    logger.debug(f"未匹配到 JavBus 演员：{name}（番号 {code}，候选 {actors}）")
+                    continue
             # 1) 优先取中文名（中文维基精确匹配）
             chinese = self.__get_wiki_chinese_name(matched)
-            if chinese and chinese != name:
+            if chinese and self.__normalize_actor_name(chinese) != norm_name:
                 logger.info(
                     f"命中中文名：{name} -> {chinese}（番号 {code}）"
                 )
@@ -765,7 +875,7 @@ class JavEmbyMetaRefresh(_PluginBase):
                 if str(people.get("Role") or "").strip() == name:
                     people["Role"] = chinese
                 changed = True
-            elif people.get("Name") != matched:
+            elif self.__normalize_actor_name(matched) != norm_name:
                 # 2) 无中文名则回退为规范化日文原名
                 logger.info(f"JavBus 规范化演员名：{name} -> {matched}（番号 {code}）")
                 people["Name"] = matched
@@ -1189,13 +1299,27 @@ class JavEmbyMetaRefresh(_PluginBase):
                         'Referer': "https://movie.douban.com/"
                     }, ua=settings.USER_AGENT).get_res(url=imageurl, raise_exception=True)
                 elif "wikimedia.org" in imageurl or "wikipedia.org" in imageurl:
-                    # 维基图片有防盗链：必须带 Referer，否则返回 403/429
-                    r = RequestUtils(
-                        headers={'Referer': "https://zh.wikipedia.org/"},
-                        ua=settings.USER_AGENT,
+                    # 维基图片有防盗链：必须带 Referer，否则返回 403/429。
+                    # 这里直接用 requests 下载：RequestUtils 在本环境下对该域名
+                    # 会静默返回 None（实测），改用 requests 更可靠。
+                    resp = requests.get(
+                        imageurl,
+                        headers={
+                            "User-Agent": settings.USER_AGENT
+                            or "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                            "Referer": "https://zh.wikipedia.org/",
+                        },
                         proxies=settings.PROXY,
-                        timeout=60,
-                    ).get_res(url=imageurl, raise_exception=True)
+                        timeout=30,
+                        verify=False,
+                    )
+                    if resp is not None and resp.status_code == 200 and resp.content:
+                        return base64.b64encode(resp.content).decode()
+                    logger.warn(
+                        f"{imageurl} 图片下载失败，状态码："
+                        f"{getattr(resp, 'status_code', None)}"
+                    )
+                    return None
                 else:
                     r = RequestUtils(proxies=settings.PROXY).get_res(url=imageurl, raise_exception=True)
                 if r:
