@@ -24,6 +24,7 @@
 
 import re
 from pathlib import Path
+from queue import Empty, Queue
 from threading import Event as ThreadEvent, Thread
 from time import sleep, time
 from typing import Any, Dict, List, Optional, Tuple
@@ -48,11 +49,11 @@ class P115AutoTransfer(_PluginBase):
     # 插件名称
     plugin_name = "115网盘自动整理"
     # 插件描述
-    plugin_desc = "监听 115 网盘目录（生活事件或定时轮询），自动调用 MP 整理规则入库；支持 /ol 磁力离线自动整理。"
+    plugin_desc = "监听 115 网盘目录（生活事件或定时轮询），自动调用 MP 整理规则入库；支持 /ol 磁力离线自动整理（仅处理本插件提交的离线任务）。"
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/115.png"
     # 插件版本
-    plugin_version = "1.9.0"
+    plugin_version = "1.11.0"
     # 插件作者
     plugin_author = "local"
     # 作者主页
@@ -77,6 +78,11 @@ class P115AutoTransfer(_PluginBase):
     _scanned_dirs: Dict[str, float] = {}
     # 已提交的离线任务 hash -> 提交时间（用于超时告警）
     _offline_tasks: Dict[str, float] = {}
+    # 整理提交串行队列：待提交整理的 (fileid, FileItem)，防止一次性打爆 115 接口
+    _transfer_queue: Optional[Queue] = None
+    _transfer_worker: Optional[Thread] = None
+    # 队列已登记但尚未提交的文件 ID（避免重复入队）
+    _queued_fileids: set = set()
     # 整理后待复查的源目录路径 -> 首次登记时间（用于延迟复查空目录）
     _pending_cleanup: Dict[str, float] = {}
     # 目录事件待整理队列：目录路径 -> 登记时间（目录刚建时内部文件可能尚未落盘，需延迟复查）
@@ -118,6 +124,12 @@ class P115AutoTransfer(_PluginBase):
         # 整理后清理空目录
         self._cleanup_empty_after_transfer: bool = True
         self._cleanup_delay_min: int = 3
+        # 整理提交节流：串行队列逐个提交，避免一次性打爆 115 接口触发风控
+        self._transfer_throttle_enabled: bool = True
+        # 每个文件提交后的等待间隔（秒）
+        self._transfer_interval_sec: int = 3
+        # 每个扫描批次最多提交的文件数（0 表示不限制）
+        self._transfer_batch_max: int = 10
         # 成人内容入库（绕过 MP 识别，直接按番号入库）
         self._adult_enabled: bool = True
         self._adult_library_dir: str = "/影视库/小姐姐们"
@@ -157,6 +169,10 @@ class P115AutoTransfer(_PluginBase):
             # 整理后清理空目录
             self._cleanup_empty_after_transfer = config.get("cleanup_empty_after_transfer", True)
             self._cleanup_delay_min = int(config.get("cleanup_delay_min") or 3)
+            # 整理提交节流
+            self._transfer_throttle_enabled = config.get("transfer_throttle_enabled", True)
+            self._transfer_interval_sec = max(int(config.get("transfer_interval_sec") or 3), 0)
+            self._transfer_batch_max = max(int(config.get("transfer_batch_max") or 10), 0)
             # 成人内容入库
             self._adult_enabled = config.get("adult_enabled", True)
             self._adult_library_dir = (config.get("adult_library_dir") or "/影视库/小姐姐们").strip()
@@ -201,6 +217,9 @@ class P115AutoTransfer(_PluginBase):
         if self._poll_thread and self._poll_thread.is_alive():
             self._poll_thread.join(timeout=5)
         self._poll_thread = None
+        # 整理提交线程：置空引用，worker 为 daemon 且队列持久，重载后由守护任务重建
+        self._transfer_worker = None
+        self._queued_fileids.clear()
         self._client = None
 
     # ------------------------------------------------------------------ #
@@ -463,6 +482,8 @@ class P115AutoTransfer(_PluginBase):
                                         "props": {
                                             "model": "magnet_enabled",
                                             "label": "启用磁力离线整理",
+                                            "hint": "只处理通过 /ol 或直接发送磁力链接提交的任务；其他来源（如 NextFind）转存到离线目录的文件不会被整理",
+                                            "persistent-hint": True,
                                         },
                                     }
                                 ],
@@ -694,6 +715,70 @@ class P115AutoTransfer(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VAlert",
+                                        "props": {
+                                            "type": "info",
+                                            "variant": "tonal",
+                                            "text": "整理提交节流：批量转存时逐条串行提交整理，避免短时间内大量 115 接口调用触发「访问上限」风控（触发后全体接口冷却 1 小时）。",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "transfer_throttle_enabled",
+                                            "label": "启用整理提交节流",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "transfer_interval_sec",
+                                            "label": "每条提交间隔(秒)",
+                                            "placeholder": "3",
+                                            "hint": "建议 3~5 秒；越小越快但越容易触发风控",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "transfer_batch_max",
+                                            "label": "单批最大提交数",
+                                            "placeholder": "10",
+                                            "hint": "0 表示不限制",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
                                 "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {
@@ -760,6 +845,9 @@ class P115AutoTransfer(_PluginBase):
             "magnet_timeout_min": self._magnet_timeout_min,
             "cleanup_empty_after_transfer": self._cleanup_empty_after_transfer,
             "cleanup_delay_min": self._cleanup_delay_min,
+            "transfer_throttle_enabled": self._transfer_throttle_enabled,
+            "transfer_interval_sec": self._transfer_interval_sec,
+            "transfer_batch_max": self._transfer_batch_max,
             "adult_enabled": self._adult_enabled,
             "adult_library_dir": self._adult_library_dir,
             "adult_media_server": self._adult_media_server,
@@ -845,6 +933,27 @@ class P115AutoTransfer(_PluginBase):
                     "name": "115目录事件快速整理",
                     "trigger": CronTrigger.from_crontab("*/1 * * * *"),
                     "func": self.check_pending_folders,
+                    "kwargs": {},
+                }
+            )
+        # 离线任务白名单清理（防止长期运行后 _offline_tasks 膨胀）
+        services.append(
+            {
+                "id": "P115AutoTransfer_offline_prune",
+                "name": "115磁力离线白名单清理",
+                "trigger": CronTrigger.from_crontab("0 3 * * *"),
+                "func": self.prune_offline_whitelist,
+                "kwargs": {},
+            }
+        )
+        # 整理提交线程守护（提交线程意外退出时自动重启）
+        if self._transfer_throttle_enabled:
+            services.append(
+                {
+                    "id": "P115AutoTransfer_transfer_guard",
+                    "name": "115整理提交线程守护",
+                    "trigger": CronTrigger.from_crontab("* * * * *"),
+                    "func": self.check_transfer_guard,
                     "kwargs": {},
                 }
             )
@@ -1004,8 +1113,16 @@ class P115AutoTransfer(_PluginBase):
     # 磁力离线：监控与整理
     # ------------------------------------------------------------------ #
     def check_offline_tasks(self):
-        """定时检查离线任务，完成则整理"""
+        """定时检查离线任务，完成则整理。
+
+        仅处理**本插件主动提交**的离线任务：以 ``self._offline_tasks`` 中记录的
+        info_hash 白名单为准。NextFind/其他来源自行提交到 /云下载 的任务不会被
+        命中，从而避免误整理（例如把 NF 转存的剧集正片当成磁力离线成果）。
+        """
         if not self._enabled or not self._magnet_enabled:
+            return
+        # 白名单为空时无任何待处理任务，直接返回，不触碰 /云下载
+        if not self._offline_tasks:
             return
         if not self._ensure_client():
             return
@@ -1022,7 +1139,10 @@ class P115AutoTransfer(_PluginBase):
         now = time()
         for task in tasks:
             try:
-                info_hash = str(task.get("info_hash") or "").lower()
+                info_hash = str(task.get("info_hash") or task.get("hash") or "").lower()
+                # 白名单：只处理本插件通过 /ol（或自动识别磁力消息）提交的任务
+                if not info_hash or info_hash not in self._offline_tasks:
+                    continue
                 status = task.get("status")
                 display_status = task.get("display_status") or ""
                 name = task.get("name") or ""
@@ -1054,6 +1174,21 @@ class P115AutoTransfer(_PluginBase):
                         )
             except Exception as e:
                 logger.error(f"【磁力离线】处理任务失败: {e}", exc_info=True)
+
+    def prune_offline_whitelist(self):
+        """清理超过超时阈值仍未完成的离线任务白名单记录，避免长期膨胀。
+
+        仅清除监控记录，不代表删除 115 云端任务。
+        """
+        if not self._offline_tasks:
+            return
+        now = time()
+        ttl = max(self._magnet_timeout_min, 60) * 60
+        stale = [h for h, t in self._offline_tasks.items() if (now - t) > ttl]
+        for h in stale:
+            self._offline_tasks.pop(h, None)
+        if stale:
+            logger.info(f"【磁力离线】已清理 {len(stale)} 条过期离线监控记录")
 
     def _process_finished_task(self, task: Dict[str, Any]):
         """处理已完成的离线任务：保留正片、移动、清理"""
@@ -1536,6 +1671,83 @@ class P115AutoTransfer(_PluginBase):
     # ------------------------------------------------------------------ #
     # 整理核心
     # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------ #
+    # 整理提交节流队列（防止一次性打爆 115 接口导致风控）
+    # ------------------------------------------------------------------ #
+    def _submit_transfer(self, fileitem: FileItem, file_path: Path) -> bool:
+        """把整理任务提交到串行队列。
+
+        直接调用 ``TransferChain().do_transfer()`` 会在批量转存场景下短时间
+        向 115 发起数百次接口调用，触发「访问上限」整站风控。这里改为入队，
+        由单线程 worker 按 ``transfer_interval_sec`` 间隔逐个提交。
+
+        节流关闭时退化为原行为（同步直接提交）。
+        """
+        if not self._transfer_throttle_enabled:
+            TransferChain().do_transfer(fileitem=fileitem)
+            logger.info(f"【网盘整理】{file_path} 加入整理队列（节流已关闭，直接提交）")
+            return True
+        fileid = str(fileitem.fileid or "")
+        if fileid and fileid in self._queued_fileids:
+            logger.debug(f"【网盘整理】{file_path} 已在提交队列中，跳过")
+            return False
+        self._ensure_transfer_worker()
+        if fileid:
+            self._queued_fileids.add(fileid)
+        self._transfer_queue.put((fileitem, str(file_path)))
+        logger.info(f"【网盘整理】{file_path} 已入整理队列（待提交 {self._transfer_queue.qsize()}）")
+        return True
+
+    def _ensure_transfer_worker(self):
+        """确保串行提交线程已启动"""
+        if self._transfer_queue is None:
+            self._transfer_queue = Queue()
+        if self._transfer_worker and self._transfer_worker.is_alive():
+            return
+        self._transfer_worker = Thread(
+            target=self._transfer_worker_loop,
+            name="P115AutoTransfer-transfer-worker",
+            daemon=True,
+        )
+        self._transfer_worker.start()
+        logger.info("【网盘整理】整理提交线程已启动")
+
+    def _transfer_worker_loop(self):
+        """串行消费整理队列，逐个提交并保持最小间隔"""
+        while True:
+            try:
+                fileitem, path = self._transfer_queue.get(timeout=60)
+            except Empty:
+                continue
+            except Exception as e:
+                logger.error(f"【网盘整理】整理队列异常: {e}", exc_info=True)
+                continue
+            try:
+                TransferChain().do_transfer(fileitem=fileitem)
+                logger.info(f"【网盘整理】{path} 已提交整理（剩余 {self._transfer_queue.qsize()}）")
+            except Exception as e:
+                logger.error(f"【网盘整理】提交整理失败 {path}: {e}", exc_info=True)
+            finally:
+                fid = str(fileitem.fileid or "")
+                if fid:
+                    self._queued_fileids.discard(fid)
+                try:
+                    self._transfer_queue.task_done()
+                except Exception:
+                    pass
+            if self._transfer_interval_sec:
+                sleep(self._transfer_interval_sec)
+
+    def check_transfer_guard(self):
+        """定时守护：提交线程意外退出时自动重启（并定期重置队列去重集合）"""
+        if not self._transfer_throttle_enabled or not self._enabled:
+            return
+        if self._transfer_worker and not self._transfer_worker.is_alive():
+            logger.warning("【网盘整理】整理提交线程已退出，正在重启")
+            self._ensure_transfer_worker()
+        elif not self._transfer_worker:
+            self._ensure_transfer_worker()
+
     def transfer_path(self, path: str, poll: bool = False):
         """整理指定 115 网盘目录"""
         if not self._client:
@@ -1578,7 +1790,7 @@ class P115AutoTransfer(_PluginBase):
                 if self._min_file_size and (item.get("size") or 0) < self._min_file_size * 1024 * 1024:
                     continue
                 fileitem = self._build_fileitem(item, file_path)
-                TransferChain().do_transfer(fileitem=fileitem)
+                self._submit_transfer(fileitem, file_path)
                 count += 1
                 logger.info(f"【网盘整理】{file_path} 加入整理队列")
             except Exception as e:
@@ -1592,8 +1804,9 @@ class P115AutoTransfer(_PluginBase):
             )
 
     def _transfer_folder(self, cid: int, folder_path: Path):
-        """整理目录下的媒体文件"""
+        """整理目录下的媒体文件（受 transfer_batch_max 限制单批提交数）"""
         count = 0
+        batch_max = self._transfer_batch_max
         for item in iter_files(
             self._client,
             cid=int(cid),
@@ -1618,11 +1831,16 @@ class P115AutoTransfer(_PluginBase):
                 if self._min_file_size and (item.get("size") or 0) < self._min_file_size * 1024 * 1024:
                     continue
                 fileitem = self._build_fileitem(item, file_path)
-                TransferChain().do_transfer(fileitem=fileitem)
+                self._submit_transfer(fileitem, file_path)
                 count += 1
                 logger.info(f"【网盘整理】{file_path} 加入整理队列")
             except Exception as e:
                 logger.error(f"【网盘整理】处理文件失败: {e}", exc_info=True)
+            if batch_max and count >= batch_max:
+                logger.info(
+                    f"【网盘整理】{folder_path} 已达单批上限 {batch_max} 个，剩余文件留待下次扫描"
+                )
+                break
         if count and self._notify_progress:
             self._send_notify(
                 title="【网盘整理】",
@@ -1649,8 +1867,7 @@ class P115AutoTransfer(_PluginBase):
             pickcode=event.get("pick_code"),
             modify_time=event.get("update_time"),
         )
-        TransferChain().do_transfer(fileitem=fileitem)
-        logger.info(f"【网盘整理】{file_path} 加入整理队列")
+        self._submit_transfer(fileitem, file_path)
 
     # ------------------------------------------------------------------ #
     # 工具
