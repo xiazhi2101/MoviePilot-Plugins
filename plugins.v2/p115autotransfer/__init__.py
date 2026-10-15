@@ -53,7 +53,7 @@ class P115AutoTransfer(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/115.png"
     # 插件版本
-    plugin_version = "1.11.0"
+    plugin_version = "1.12.0"
     # 插件作者
     plugin_author = "local"
     # 作者主页
@@ -1387,6 +1387,20 @@ class P115AutoTransfer(_PluginBase):
                 result.append(child)
         return result
 
+    @staticmethod
+    def _collect_child_files(pan, dir_item: FileItem) -> List[FileItem]:
+        """只收集目录的直属文件（不递归）
+
+        用于「判空」：递归遍历会排除目录自身，导致监控根目录在本轮文件
+        全部整理完时被误判为空目录并删除。
+        """
+        try:
+            children = pan.list(dir_item) or []
+        except Exception as e:
+            logger.warning(f"【磁力离线】列目录失败 {dir_item.path}: {e}")
+            return []
+        return [c for c in children if c.type != "dir"]
+
     def _cleanup_empty_dirs(self, pan):
         """清理离线目录下遗留的空目录"""
         root = pan.get_item(Path(self._magnet_offline_dir))
@@ -1400,24 +1414,68 @@ class P115AutoTransfer(_PluginBase):
         for child in children:
             if child.type != "dir":
                 continue
+            if self._is_protected_dir(child):
+                logger.debug(f"【磁力离线】{child.path} 为受保护目录，跳过清理")
+                continue
             try:
                 sub = pan.list(child) or []
                 if not sub:
                     pan.delete(child)
                     logger.info(f"【磁力离线】已删除空目录：{child.path}")
+                else:
+                    logger.debug(f"【磁力离线】{child.path} 非空，保留")
             except Exception as e:
                 logger.warning(f"【磁力离线】删除空目录失败 {child.path}: {e}")
 
     # ------------------------------------------------------------------ #
     # 整理后空目录清理
     # ------------------------------------------------------------------ #
+    def _protected_cleanup_paths(self) -> List[str]:
+        """绝不允许自动删除的目录：所有监控/离线根目录本身
+
+        这些目录是用户手工建立的固定落点，文件整理走空是正常状态，
+        删除它们会让后续转存无处落地。
+        """
+        paths: List[str] = []
+        for p in self._iter_transfer_paths():
+            if p:
+                paths.append(Path(p).as_posix())
+        for p in (self._manual_transfer_dir, self._magnet_offline_dir):
+            if p:
+                paths.append(Path(p).as_posix())
+        return paths
+
+    def _is_protected_dir(self, item) -> bool:
+        """判断某个 115 目录是否为受保护的监控/离线根目录"""
+        try:
+            item_path = Path(str(getattr(item, "path", "") or "")).as_posix()
+        except Exception:
+            return False
+        if not item_path:
+            return False
+        candidates = {item_path, item_path.rstrip("/") or item_path}
+        for protected in self._protected_cleanup_paths():
+            if candidates & {protected, protected.rstrip("/") or protected}:
+                return True
+        return False
+
     def _schedule_cleanup(self, path: str):
         """整理完成后登记源目录，延迟复查是否可删除"""
         if not self._cleanup_empty_after_transfer or not path:
             return
         try:
+            normal = Path(str(path)).as_posix()
+            for protected in self._protected_cleanup_paths():
+                # 命中监控根目录本身时不再登记删除，只保序记录
+                if normal == protected or not self._has_prefix(Path(normal), protected):
+                    if normal == protected:
+                        logger.debug(f"【网盘整理】{normal} 为监控根目录，跳过空目录清理登记")
+                        return
+                    continue
             self._pending_cleanup[path] = time()
             logger.info(f"【网盘整理】已登记空目录复查：{path}")
+        except Exception as e:
+            logger.warning(f"【网盘整理】登记空目录复查失败 {path}: {e}")
         except Exception as e:
             logger.warning(f"【网盘整理】登记空目录复查失败 {path}: {e}")
 
@@ -1525,7 +1583,14 @@ class P115AutoTransfer(_PluginBase):
                 self._pending_cleanup.pop(path, None)
 
     def _cleanup_source_dir(self, path: str):
-        """若目录内已无任何文件（只剩空文件夹），删除该目录"""
+        """若目录内已无任何文件（只剩空文件夹），删除该目录
+
+        安全约束（防止误删监控根目录）：
+        1. 监控/离线根目录本身永不删除；
+        2. 只用**直属**文件判断是否为空，不递归（递归会排除目录自身，
+           导致监控根目录在本轮文件全部整理完时被判空）；
+        3. 目录内仍有子目录时保留，由上层逐个处理。
+        """
         from app.modules.filemanager.storages.u115 import U115Pan
 
         pan = U115Pan()
@@ -1535,9 +1600,20 @@ class P115AutoTransfer(_PluginBase):
             return
         if item.type != "dir":
             return
-        files = self._collect_files(pan, item)
+        if self._is_protected_dir(item):
+            logger.info(f"【网盘整理】{path} 为监控根目录，保留不删除")
+            return
+        files = self._collect_child_files(pan, item)
         if files:
             logger.info(f"【网盘整理】源目录仍有 {len(files)} 个文件，保留：{path}")
+            return
+        try:
+            children = pan.list(item) or []
+        except Exception as e:
+            logger.warning(f"【网盘整理】列目录失败，跳过清理 {path}: {e}")
+            return
+        if any(c.type == "dir" for c in children):
+            logger.info(f"【网盘整理】源目录仍有子目录，保留：{path}")
             return
         if pan.delete(item):
             logger.info(f"【网盘整理】已删除整理后空目录：{path}")
