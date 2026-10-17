@@ -36,7 +36,7 @@ class MyNfMissingMonitor(_PluginBase):
     plugin_name = "缺集监测(自建)"
     plugin_desc = "定时监测 MP 订阅缺集，用 NextFind 搜索补全（支持 ed2k/115 拆包转存），转存后校验文件实际落地。NF 无资源时直接跳过，不做 PT 兜底。"
     plugin_icon = "nfmissingmonitor.png"
-    plugin_version = "2.1.4"
+    plugin_version = "2.1.5"
     plugin_label = "订阅,资源管理,智能体"
     plugin_author = "local"
     plugin_config_prefix = "mynfmissingmonitor_"
