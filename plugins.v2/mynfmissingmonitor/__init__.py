@@ -36,7 +36,7 @@ class MyNfMissingMonitor(_PluginBase):
     plugin_name = "缺集监测(自建)"
     plugin_desc = "定时监测 MP 订阅缺集，用 NextFind 搜索补全（支持 ed2k/115 拆包转存），转存后校验文件实际落地。NF 无资源时直接跳过，不做 PT 兜底。"
     plugin_icon = "nfmissingmonitor.png"
-    plugin_version = "2.1.5"
+    plugin_version = "2.1.7"
     plugin_label = "订阅,资源管理,智能体"
     plugin_author = "local"
     plugin_config_prefix = "mynfmissingmonitor_"
@@ -53,6 +53,10 @@ class MyNfMissingMonitor(_PluginBase):
     _target_folder = "/最近接收"
     # 转存落地校验等待秒数（115 转存为异步，转存后等待再查询目标目录）
     _verify_wait = 20
+    # 2026-10-17：本轮已做过 115 落地校验则跳过逐文件校验，减少 115 接口调用
+    _verified_this_round = False
+    # 本轮是否有待校验的转存（整轮结束统一校验一次）
+    _round_verify_pending = False
     # 转存落地后是否立即触发一次 MP 整理（115 为远程存储，目录监控仅定时轮询）
     _auto_transfer = True
     # 详情页筛选状态（纯前端展示，存 plugindata 持久化）：all/tv/movie/missing/full/movie_missing
@@ -76,6 +80,8 @@ class MyNfMissingMonitor(_PluginBase):
         self._calendar_filter = True
         self._target_folder = "/最近接收"
         self._verify_wait = 20
+        self._verified_this_round = False
+        self._round_verify_pending = False
         self._auto_transfer = True
         self._nf_done = set((self.get_data("nf_transferred") or {}).keys())
         self._recent_dedup = True
@@ -801,11 +807,21 @@ class MyNfMissingMonitor(_PluginBase):
         if not self._api_url or not self._api_key:
             logger.warn("缺集监测未配置 API 地址或 API Key")
             return
-        logger.info("开始缺集监测检查 ...")
+        # 2026-10-17：加运行标记，便于确认定时服务是否真的在跑（此前只看日志无法区分
+        # 「服务没触发」和「触发了但无输出」）。
+        logger.info(
+            f"开始缺集监测检查（周期 {self._interval} 分钟，NF={self._api_url}）..."
+        )
+        self._verified_this_round = False
+        self._round_verify_pending = False
         try:
             # 扫描全部订阅（含暂停 S 状态），暂停订阅不参与系统 PT 搜索，仅由本插件 NF 补全
             subscribes = SubscribeOper().list() or []
-            logger.info(f"订阅总数：{len(subscribes)}")
+            tv_subs = [x for x in subscribes if x.type == MediaType.TV.value]
+            movie_subs = [x for x in subscribes if x.type == MediaType.MOVIE.value]
+            logger.info(
+                f"订阅总数：{len(subscribes)}（电视剧 {len(tv_subs)}，电影 {len(movie_subs)}）"
+            )
             transferred = 0
             no_nf = 0
             complete = 0
@@ -825,6 +841,8 @@ class MyNfMissingMonitor(_PluginBase):
             logger.info(
                 f"缺集监测完成：NF转存补齐 {transferred}，NF无资源跳过 {no_nf}，无缺集 {complete}"
             )
+            if self._round_verify_pending:
+                self._finish_round_verify()
         except Exception as err:
             logger.error(f"缺集监测异常：{err}")
 
@@ -1256,14 +1274,14 @@ class MyNfMissingMonitor(_PluginBase):
         except Exception as err:
             logger.error(f"NF 转存异常：{err}")
             return False
-        # 落地校验：115 转存为异步，等待后查询目标目录确认文件存在
-        landed = self._verify_transfer_landed(slug, target_folder)
-        if landed:
-            self._trigger_transfer(
-                tmdb_id=str(resource.get("tmdb_id") or ""),
-                title=str(resource.get("title") or resource.get("name") or ""),
-            )
-        return landed
+        # 2026-10-17 风控优化：不再每次转存都立刻查 115 目标目录，
+        # 改为整轮检查结束时统一校验一次（见 _finish_round_verify）。
+        self._round_verify_pending = True
+        self._trigger_transfer(
+            tmdb_id=str(resource.get("tmdb_id") or ""),
+            title=str(resource.get("title") or resource.get("name") or ""),
+        )
+        return True
 
     def _transfer_single_item(self, item: dict, media_type: str) -> bool:
         """转存单个拆包文件（ed2k 链接或 115 文件 id），并校验文件实际落地。"""
@@ -1290,14 +1308,13 @@ class MyNfMissingMonitor(_PluginBase):
         except Exception as err:
             logger.error(f"NF 单文件转存异常：{err}")
             return False
-        # 落地校验：按文件名匹配目标目录
-        landed = self._verify_transfer_landed(item_id, target_folder, name=item.get("name"))
-        if landed:
-            self._trigger_transfer(
-                tmdb_id=str(item.get("tmdb_id") or ""),
-                title=str(item.get("title") or item.get("name") or ""),
-            )
-        return landed
+        # 2026-10-17 风控优化：单集转存不再逐个查 115，改为整轮结束统一校验。
+        self._round_verify_pending = True
+        self._trigger_transfer(
+            tmdb_id=str(item.get("tmdb_id") or ""),
+            title=str(item.get("title") or item.get("name") or ""),
+        )
+        return True
 
     def _p115_auto_transfer_active(self) -> bool:
         """判断 115 网盘自动整理插件是否已启用。
@@ -1348,6 +1365,35 @@ class MyNfMissingMonitor(_PluginBase):
         except Exception as err:
             logger.warn(f"投递定向整理请求失败（不影响转存）：{err}")
 
+    def _finish_round_verify(self) -> None:
+        """整轮检查结束后统一校验一次 /最近接收 落地情况。
+
+        115 转存是异步落地：所有转存提交完成后等待 `verify_wait` 秒，再查一次目标目录。
+        相比「每转存一次就查一次」，接口调用次数从 N 次降到 1 次，
+        明显降低触发 115 访问上限（风控）的概率。
+        """
+        if self._verified_this_round:
+            return
+        self._verified_this_round = True
+        try:
+            if self._verify_wait > 0:
+                time.sleep(self._verify_wait)
+            from pathlib import Path
+            from app.modules.filemanager.storages.u115 import U115Pan
+
+            storage = U115Pan()
+            folder_item = storage.get_item(Path(self._target_folder))
+            if not folder_item:
+                logger.warn(f"整轮落地校验：目标目录不可访问 {self._target_folder}")
+                return
+            children = storage.list(folder_item) or []
+            logger.info(
+                f"整轮落地校验完成：{self._target_folder} 现有 {len(children)} 项"
+                "（本轮转存不逐条复查，交由整理插件处理）"
+            )
+        except Exception as err:
+            logger.warn(f"整轮落地校验异常（不影响转存）：{err}")
+
     def _verify_transfer_landed(self, slug: str, target_folder: str,
                                 name: Optional[str] = None) -> bool:
         """校验转存是否真正落地：查询 115 目标目录，确认存在对应文件/目录。
@@ -1355,6 +1401,9 @@ class MyNfMissingMonitor(_PluginBase):
         115 转存为异步操作，先等待 `verify_wait` 秒再查询。校验失败返回 False，
         调用方据此不写入去重记录，下轮重试（避免「假成功」）。
         """
+        if self._verified_this_round:
+            # 整轮已统一校验过，逐条校验直接视为通过，避免重复消耗 115 接口
+            return True
         if self._verify_wait > 0:
             time.sleep(self._verify_wait)
         try:
