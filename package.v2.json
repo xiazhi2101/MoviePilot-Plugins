@@ -3,7 +3,7 @@
     "name": "115网盘自动整理",
     "description": "监听 115 网盘目录（生活事件实时监听 / 定时轮询可切换），命中媒体文件后调用 MoviePilot 整理规则自动入库。支持 /p115_transfer 手动整理；支持 /ol 磁力离线下载并自动整理入库。",
     "labels": "网盘整理",
-    "version": "1.16.2",
+    "version": "1.16.1",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/115.png",
     "author": "local",
     "level": 1,
