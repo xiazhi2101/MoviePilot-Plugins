@@ -36,7 +36,7 @@ class MyNfMissingMonitor(_PluginBase):
     plugin_name = "缺集监测(自建)"
     plugin_desc = "定时监测 MP 订阅缺集，用 NextFind 搜索补全（支持 ed2k/115 拆包转存），转存后校验文件实际落地。NF 无资源时直接跳过，不做 PT 兜底。"
     plugin_icon = "nfmissingmonitor.png"
-    plugin_version = "2.1.2"
+    plugin_version = "2.1.3"
     plugin_label = "订阅,资源管理,智能体"
     plugin_author = "local"
     plugin_config_prefix = "mynfmissingmonitor_"
@@ -86,6 +86,19 @@ class MyNfMissingMonitor(_PluginBase):
         self._enabled = bool(config.get("enabled"))
         self._api_url = str(config.get("api_url") or "").rstrip("/")
         self._api_key = str(config.get("api_key") or "")
+        # 2026-10-17：缺集监测与 NextFind 控制器共用同一套 NF 接口。
+        # 这里没填地址/Key 时，回退读取 NextFindController 的配置，避免两处各填一遍
+        # 导致漏填后整轮监测直接跳过。
+        if not self._api_url or not self._api_key:
+            try:
+                nf_conf = self.get_config("NextFindController") or {}
+                if isinstance(nf_conf, dict):
+                    self._api_url = self._api_url or str(nf_conf.get("api_url") or "").rstrip("/")
+                    self._api_key = self._api_key or str(nf_conf.get("api_key") or "")
+                    if self._api_url and self._api_key:
+                        logger.info("缺集监测复用 NextFind 控制器的 NF 接口配置")
+            except Exception as err:
+                logger.debug(f"读取 NextFindController 配置失败（忽略）：{err}")
         try:
             self._interval = max(5, int(config.get("interval") or 120))
         except (TypeError, ValueError):
