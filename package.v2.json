@@ -79,5 +79,21 @@
       "v2.1.2": "修正新版 MP 订阅对象无 tmdbid 属性导致缺集监测全部跳过（兼容 media_id/media_source）",
       "v2.1.3": "未配置 NF 地址/Key 时回退复用 NextFind 控制器配置，避免整轮缺集监测直接跳过"
     }
+  },
+  "NextFindController": {
+    "name": "NextFind 控制器",
+    "description": "通过 Agent 对话控制 NextFind（NF）的搜索、订阅、转存、额度查询等 API 能力；并可自动订阅指定频道转存入库的新资源；内置 /nf 一键获取命令（搜索→选最高画质→转存 /最近接收→触发整理）。",
+    "labels": "智能体,资源管理",
+    "version": "1.6.0",
+    "icon": "nextfindcontroller.png",
+    "author": "local",
+    "level": 1,
+    "history": {
+      "v1.3.0": "从 NfController(自建) 移植 /nf 一键获取命令：搜索媒体→选最高画质→转存 /最近接收→延迟触发整理",
+      "v1.4.0": "/nf 只负责转存，整理交由 P115AutoTransfer 定向整理",
+      "v1.5.0": "NF 自身整理逻辑改为注释保留+开关关闭（_nf_dispatch_target=False），/nf 只做转存，整理统一由 P115AutoTransfer 负责",
+      "v1.6.0": "/nf 支持自定义转存目录（配置项 nf_target_folder，默认 /最近接收），方便他人复用"
+    },
+    "system_version": ">=2.12.0"
   }
 }
