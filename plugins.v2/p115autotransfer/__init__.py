@@ -53,7 +53,7 @@ class P115AutoTransfer(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/115.png"
     # 插件版本
-    plugin_version = "1.12.0"
+    plugin_version = "1.16.1"
     # 插件作者
     plugin_author = "local"
     # 作者主页
@@ -101,15 +101,21 @@ class P115AutoTransfer(_PluginBase):
         self._trigger_mode: str = "life"  # life / poll
         self._transfer_paths: Optional[str] = None
         self._poll_cron: str = "*/5 * * * *"
+        # 生活事件模式下的轮询兜底（捕获 115 未推送事件导致遗漏的文件）
+        self._fallback_scan_enabled: bool = True
+        self._fallback_scan_cron: str = "*/5 * * * *"
         self._min_file_size: int = 0  # MB
         # 默认纳入 new_folder：分享转存/整包转存常只产生目录事件，不补会导致漏整理
-        self._event_modes: List[str] = ["upload_file", "receive_files", "move_file", "new_folder"]
+        # 默认纳入 file_rename：115 转存完成后会对文件重命名，该事件是文件落盘的实际信号
+        self._event_modes: List[str] = ["upload_file", "receive_files", "move_file", "new_folder", "file_rename"]
         # 目录事件实时整理：目录事件到达即扫描，内部文件未落盘时按短间隔快速重试
         self._folder_delay_sec: int = 0
         # 空目录快速重试间隔（秒），配合 1 分钟定时任务实现准实时
-        self._folder_retry_sec: int = 5
+        # 10 秒兼顾响应速度与接口压力：文件落盘后最迟 10 秒即开始整理
+        self._folder_retry_sec: int = 10
         # 目录事件延迟复查最大轮次，超出后不再重复登记
-        self._folder_max_retry: int = 24
+        # 10 秒 × 90 次 = 15 分钟总等待窗口，覆盖常规转存落盘耗时
+        self._folder_max_retry: int = 90
         self._last_error: Optional[str] = None
         # 磁力离线自动整理
         self._magnet_enabled: bool = True
@@ -121,6 +127,9 @@ class P115AutoTransfer(_PluginBase):
         self._auto_magnet: bool = True
         self._magnet_cron: str = "*/2 * * * *"
         self._magnet_timeout_min: int = 180
+        # 兜底扫描：白名单未命中时，仍整理离线目录中已落盘的正片目录
+        # （用于 115 提交离线未返回 info_hash 的场景）
+        self._magnet_fallback_scan: bool = True
         # 整理后清理空目录
         self._cleanup_empty_after_transfer: bool = True
         self._cleanup_delay_min: int = 3
@@ -148,6 +157,8 @@ class P115AutoTransfer(_PluginBase):
             self._trigger_mode = config.get("trigger_mode") or "life"
             self._transfer_paths = config.get("transfer_paths") or None
             self._poll_cron = config.get("poll_cron") or "*/5 * * * *"
+            self._fallback_scan_enabled = bool(config.get("fallback_scan_enabled", True))
+            self._fallback_scan_cron = config.get("fallback_scan_cron") or "*/5 * * * *"
             self._min_file_size = int(config.get("min_file_size") or 0)
             modes = config.get("event_modes")
             if isinstance(modes, list) and modes:
@@ -156,8 +167,8 @@ class P115AutoTransfer(_PluginBase):
                 self._event_modes = [m.strip() for m in modes.split(",") if m.strip()]
             # 目录事件实时整理参数
             self._folder_delay_sec = int(config.get("folder_delay_sec") or 0)
-            self._folder_retry_sec = int(config.get("folder_retry_sec") or 5)
-            self._folder_max_retry = int(config.get("folder_max_retry") or 24)
+            self._folder_retry_sec = int(config.get("folder_retry_sec") or 10)
+            self._folder_max_retry = int(config.get("folder_max_retry") or 90)
             # 磁力离线
             self._magnet_enabled = config.get("magnet_enabled", True)
             self._magnet_offline_dir = (config.get("magnet_offline_dir") or "/云下载").strip()
@@ -166,6 +177,7 @@ class P115AutoTransfer(_PluginBase):
             self._auto_magnet = bool(config.get("auto_magnet", True))
             self._magnet_cron = config.get("magnet_cron") or "*/2 * * * *"
             self._magnet_timeout_min = int(config.get("magnet_timeout_min") or 180)
+            self._magnet_fallback_scan = bool(config.get("magnet_fallback_scan", True))
             # 整理后清理空目录
             self._cleanup_empty_after_transfer = config.get("cleanup_empty_after_transfer", True)
             self._cleanup_delay_min = int(config.get("cleanup_delay_min") or 3)
@@ -359,6 +371,37 @@ class P115AutoTransfer(_PluginBase):
                                 "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "fallback_scan_enabled",
+                                            "label": "事件模式兜底轮询",
+                                            "hint": "生活事件模式下定时扫描整理目录，捕获 115 未推送事件导致遗漏的文件",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "fallback_scan_cron",
+                                            "label": "兜底扫描 Cron",
+                                            "placeholder": "*/5 * * * *",
+                                            "hint": "建议 3~10 分钟一次，过密会触发 115 接口风控",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
                                         "component": "VTextField",
                                         "props": {
                                             "model": "min_file_size",
@@ -428,6 +471,10 @@ class P115AutoTransfer(_PluginBase):
                                                 {
                                                     "title": "复制文件夹",
                                                     "value": "copy_folder",
+                                                },
+                                                {
+                                                    "title": "重命名文件（转存落盘信号）",
+                                                    "value": "file_rename",
                                                 },
                                             ],
                                         },
@@ -563,7 +610,22 @@ class P115AutoTransfer(_PluginBase):
                                         },
                                     }
                                 ],
-                            }
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "magnet_fallback_scan",
+                                            "label": "兜底整理离线残留",
+                                            "hint": "115 提交离线未返回 info_hash 时，仍整理离线目录中已落盘的正片目录（仅处理含视频的目录）",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
                         ],
                     },
                     {
@@ -831,6 +893,8 @@ class P115AutoTransfer(_PluginBase):
             "trigger_mode": self._trigger_mode,
             "transfer_paths": self._transfer_paths,
             "poll_cron": self._poll_cron,
+            "fallback_scan_enabled": self._fallback_scan_enabled,
+            "fallback_scan_cron": self._fallback_scan_cron,
             "min_file_size": self._min_file_size,
             "event_modes": self._event_modes,
             "folder_delay_sec": self._folder_delay_sec,
@@ -843,6 +907,7 @@ class P115AutoTransfer(_PluginBase):
             "auto_magnet": self._auto_magnet,
             "magnet_cron": self._magnet_cron,
             "magnet_timeout_min": self._magnet_timeout_min,
+            "magnet_fallback_scan": self._magnet_fallback_scan,
             "cleanup_empty_after_transfer": self._cleanup_empty_after_transfer,
             "cleanup_delay_min": self._cleanup_delay_min,
             "transfer_throttle_enabled": self._transfer_throttle_enabled,
@@ -889,6 +954,17 @@ class P115AutoTransfer(_PluginBase):
                     "name": "115网盘目录轮询整理",
                     "trigger": CronTrigger.from_crontab(self._poll_cron),
                     "func": self.poll_once,
+                    "kwargs": {},
+                }
+            )
+        # 生活事件模式下的轮询兜底：捕获 115 未推送事件导致遗漏的文件
+        if self._trigger_mode == "life" and self._fallback_scan_enabled and self._fallback_scan_cron:
+            services.append(
+                {
+                    "id": "P115AutoTransfer_fallback",
+                    "name": "115目录兜底轮询整理",
+                    "trigger": CronTrigger.from_crontab(self._fallback_scan_cron),
+                    "func": self.fallback_scan_transfer_paths,
                     "kwargs": {},
                 }
             )
@@ -1115,16 +1191,20 @@ class P115AutoTransfer(_PluginBase):
     def check_offline_tasks(self):
         """定时检查离线任务，完成则整理。
 
-        仅处理**本插件主动提交**的离线任务：以 ``self._offline_tasks`` 中记录的
-        info_hash 白名单为准。NextFind/其他来源自行提交到 /云下载 的任务不会被
-        命中，从而避免误整理（例如把 NF 转存的剧集正片当成磁力离线成果）。
+        优先处理**本插件主动提交**的离线任务：以 ``self._offline_tasks`` 中记录的
+        info_hash 白名单为准，避免误整理 NextFind 等其他来源转入 /云下载 的内容。
+
+        白名单未命中时（例如 115 提交离线未返回 info_hash），按配置启用兜底扫描：
+        只整理离线目录中已落盘且含视频的直属子目录，并通过 ``offline_processed``
+        去重，避免重复整理与误伤进行中的任务。
         """
         if not self._enabled or not self._magnet_enabled:
             return
-        # 白名单为空时无任何待处理任务，直接返回，不触碰 /云下载
-        if not self._offline_tasks:
-            return
         if not self._ensure_client():
+            return
+        # 白名单为空：直接尝试兜底扫描（若已启用）
+        if not self._offline_tasks:
+            self._fallback_scan_offline()
             return
         try:
             resp = self._client.clouddownload_task_list(
@@ -1174,6 +1254,79 @@ class P115AutoTransfer(_PluginBase):
                         )
             except Exception as e:
                 logger.error(f"【磁力离线】处理任务失败: {e}", exc_info=True)
+
+        # 白名单未命中任何任务时，兜底扫描离线目录中的已完成残留
+        self._fallback_scan_offline()
+
+    def _fallback_scan_offline(self) -> None:
+        """兜底扫描：白名单未命中时，整理离线目录中已落盘的正片目录。
+
+        用于 115 提交离线时未返回 info_hash（白名单为空）的场景，例如
+        ``clouddownload_task_add_url`` 只返回任务 id 的情况。安全约束：
+
+        - 只扫描离线目录的**直属子目录**，不递归更深的层级；
+        - 目录内必须含有效正片（体积最大的文件，且不是推广文件）才处理，
+          避免动到进行中的空目录；
+        - 只有推广文件、或正片仍在下载中时跳过，等待后续扫描；
+        - 已处理过的目录通过 ``offline_processed`` 记录去重，不重复整理。
+        """
+        if not self._enabled or not self._magnet_enabled or not self._magnet_fallback_scan:
+            return
+        if not self._ensure_client():
+            return
+        try:
+            from app.modules.filemanager.storages.u115 import U115Pan
+
+            pan = U115Pan()
+            root = pan.get_item(Path(self._magnet_offline_dir))
+            if not root or root.type != "dir":
+                return
+            children = pan.list(root) or []
+        except Exception as e:
+            logger.warning(f"【磁力离线】兜底扫描列目录失败：{e}")
+            return
+
+        for child in children:
+            try:
+                if child.type != "dir":
+                    continue
+                # 去重：已处理过的目录不再重复整理
+                guard = f"dir:{Path(str(child.path)).name}"
+                if self._is_task_processed(guard):
+                    continue
+                files = self._collect_files(pan, child)
+                if not files:
+                    # 目录存在但一个文件都没列出来：与「整包都是推广」是
+                    # 完全不同的故障，必须区分日志，否则会被误读成
+                    # 「正片还在下载中」而无限期等待。
+                    logger.warning(
+                        f"【磁力离线】兜底跳过（目录内未读到任何文件，"
+                        f"可能是列目录失败/限流，非推广过滤所致）：{child.path}"
+                    )
+                    continue
+                # 正片 = 体积最大的文件；仅排除推广文件。
+                # 不要求 ``_is_video`` 命中：115 列表接口对部分文件返回空的
+                # extension，仅凭扩展名白名单会漏掉真正的正片，导致误跳过；
+                # 离线目录内最大的非推广文件已是可靠的正片判据。
+                valid_mains = [
+                    f for f in files
+                    if not self._is_promo_file(f.basename or f.name, f.size)
+                ]
+                if not valid_mains:
+                    # 已列出 N 个文件但全部被判为推广：跳过，避免把广告
+                    # 当正片入库、并误删真正的正片
+                    logger.info(
+                        f"【磁力离线】兜底跳过（{len(files)} 个文件均为推广，"
+                        f"无有效正片）：{child.path}"
+                    )
+                    continue
+                del_path = Path(str(child.path)).name
+                logger.info(f"【磁力离线】兜底整理离线残留：{child.path}")
+                self._process_finished_task({"name": del_path, "del_path": del_path})
+                self._mark_task_processed(guard)
+            except Exception as e:
+                logger.error(f"【磁力离线】兜底扫描处理失败 {getattr(child, 'path', child)}: {e}",
+                             exc_info=True)
 
     def prune_offline_whitelist(self):
         """清理超过超时阈值仍未完成的离线任务白名单记录，避免长期膨胀。
@@ -1225,12 +1378,20 @@ class P115AutoTransfer(_PluginBase):
                 logger.warning(f"【磁力离线】目录内无文件：{src_path}")
                 return
 
-            # 正片 = 体积最大的视频文件
-            videos = [f for f in files if self._is_video(f)]
-            if not videos:
-                # 无视频文件，取体积最大的文件兜底
-                videos = sorted(files, key=lambda x: x.size or 0, reverse=True)[:1]
-            main = max(videos, key=lambda x: x.size or 0)
+            # 正片 = 体积最大的文件（先排除推广/广告文件）
+            candidates = [
+                f for f in files
+                if not self._is_promo_file(f.basename or f.name, f.size)
+            ]
+            if not candidates:
+                # 无有效正片（可能整包都是推广）：跳过本次，
+                # 避免把广告当正片入库、并误删真正的正片
+                logger.warning(
+                    f"【磁力离线】未找到有效正片（{len(files)} 个文件均为推广），"
+                    f"跳过等待下次扫描：{src_path}"
+                )
+                return
+            main = max(candidates, key=lambda x: x.size or 0)
             main_name = self._clean_main_name(main.basename or Path(main.name).stem)
 
             # 删除其余全部文件
@@ -1744,6 +1905,24 @@ class P115AutoTransfer(_PluginBase):
             except Exception as e:
                 logger.error(f"【网盘整理】轮询整理 {path} 失败: {e}", exc_info=True)
 
+    def fallback_scan_transfer_paths(self):
+        """轮询兜底：扫描整理目录，补齐 115 生活事件遗漏的文件。
+
+        生活事件模式下若 115 未推送事件（例如转存未产生 receive_files/new_folder），
+        插件不会感知到新文件。此方法按 ``poll_scan_cron`` 定时扫描 transfer_paths，
+        捕获遗漏并整理，与事件监听形成互补。
+        """
+        if not self._enabled or not self._fallback_scan_enabled:
+            return
+        if not self._ensure_client():
+            return
+        for path in self._iter_transfer_paths():
+            try:
+                logger.info(f"【网盘整理】兜底轮询扫描：{path}")
+                self.transfer_path(path, poll=True)
+            except Exception as e:
+                logger.error(f"【网盘整理】兜底轮询 {path} 失败: {e}", exc_info=True)
+
     # ------------------------------------------------------------------ #
     # 整理核心
     # ------------------------------------------------------------------ #
@@ -2049,6 +2228,80 @@ class P115AutoTransfer(_PluginBase):
     # 番号主体：字母数字组合（如 BACJ-192、SNOS-406-C、SSIS00123）
     _CODE_RE = re.compile(r"[A-Za-z]{2,10}[-_]?\d{2,6}(?:[-_][A-Za-z0-9]{1,4})*")
 
+    # 推广判定豁免阈值：超过该体积的文件一律视为正片
+    # 推广广告视频通常只有十几 MB，正片动辄数 GB，用体积兜住番号抽不出的正片
+    _PROMO_SIZE_EXEMPT_BYTES = 1024 ** 3  # 1 GB
+
+    # 推广/广告文件名特征：社区情报、聚合直播、最新地址、加群、水印等（含繁体）
+    _PROMO_NAME_RE = re.compile(
+        r"更多无水印|无水印|最\s*新\s*地\s*址|最\s*新\s*位\s*址|获\s*取\s*地\s*址"
+        r"|社\s*[区區]\s*最\s*新|情\s*[报報]|聚\s*合|直\s*播|加\s*群"
+        r"|官\s*[网網]|首\s*[页頁]|水\s*印|广\s*告|廣\s*告|推\s*广|推\s*廣"
+        r"|最\s*强|最\s*強|请\s*访\s*问|請\s*訪\s*問|发\s*布\s*页|發\s*佈\s*頁",
+        re.IGNORECASE,
+    )
+    # 网址痕迹：www. / http
+    _PROMO_URL_RE = re.compile(r"w\s*w\s*w\s*\.|h\s*t\s*t\s*p", re.IGNORECASE)
+    # 推广域名（允许字符间空白，对抗拆字符命名）
+    _PROMO_DOMAIN_RE = re.compile(
+        r"(?:[a-z0-9]\s*){2,}\.\s*(?:c\s*o\s*m|n\s*e\s*t|c\s*c|t\s*v|o\s*r\s*g|x\s*y\s*z"
+        r"|t\s*o\s*p|i\s*n\s*f\s*o|v\s*i\s*p|m\s*e|i\s*o|u\s*s|c\s*n)",
+        re.IGNORECASE,
+    )
+
+    # 常见媒体扩展名（用于剥离真实扩展名，避免 ``.com@`` 被误认为后缀）
+    _MEDIA_EXT_RE = re.compile(
+        r"\.(?:mp4|mkv|avi|wmv|mov|ts|m2ts|iso|rmvb|flv|webm|mpg|mpeg|m4v|strm|"
+        r"ass|srt|ssa|sub|idx|sup)$",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _strip_media_ext(cls, name: str) -> str:
+        """去掉文件名末尾的媒体扩展名。
+
+        带推广域名的命名（如 ``489155.com@START00639_4KS.mp4``）用
+        ``Path.stem`` 会被误判为 ``489155``，这里只剥离已知媒体扩展名，
+        保留 ``域名@番号`` 主体供番号正则匹配。
+        """
+        return cls._MEDIA_EXT_RE.sub("", (name or "").strip()).strip()
+
+    def _is_promo_file(self, name: str, size: Optional[int] = None) -> bool:
+        """判断文件名是否属于推广/广告内容。
+
+        用于磁力离线选正片时排除推广视频，避免把广告当成正片入库。
+        优先判定番号：文件名含番号（如 ``489155.com@BACJ-192``）时视为正片，
+        即使带推广域名前缀也不判为推广——这类命名是发布组给正片加的前缀。
+
+        其次判定体积：超过 ``_PROMO_SIZE_EXEMPT_BYTES`` 的文件直接豁免，
+        因为推广广告片普遍只有十几 MB，而正片动辄数 GB。此规则可覆盖
+        ``489155.com@START00639_4KS.mp4`` 这类番号正则抽不出番号、
+        但明显是正片（12.4GB）的命名，避免误判为推广后整包被判"无有效正片"。
+
+        注意：带推广域名的文件名里 ``.com@`` 会被 ``Path.suffix`` 误认成扩展名，
+        因此番号匹配必须针对去掉真实扩展名后的原字符串，而不是 ``Path.stem``。
+
+        :param name: 文件名（可含扩展名）
+        :param size: 文件体积（字节）；传入后启用大体积豁免，None 时跳过该规则
+        :return: 命中推广特征返回 True
+        """
+        raw = (name or "").strip()
+        if not raw:
+            return False
+        # 体积优先：大文件一律认定为正片，避免被推广域名/关键词规则误伤
+        if size is not None and size > self._PROMO_SIZE_EXEMPT_BYTES:
+            return False
+        # 番号优先：命中番号即认定为正片，避免被推广域名前缀误伤
+        if self._CODE_RE.search(self._strip_media_ext(raw)):
+            return False
+        if self._PROMO_URL_RE.search(raw):
+            return True
+        if self._PROMO_DOMAIN_RE.search(raw):
+            return True
+        if self._PROMO_NAME_RE.search(raw):
+            return True
+        return False
+
     def _clean_main_name(self, name: str) -> str:
         """清洗正片文件名，提取纯番号。
 
@@ -2056,9 +2309,7 @@ class P115AutoTransfer(_PluginBase):
         """
         if not name:
             return name
-        raw = name.strip()
-        # 去掉扩展名残留
-        raw = re.sub(r"\.(mp4|mkv|avi|wmv|mov|ts|m2ts|iso|rmvb|flv|webm)$", "", raw, flags=re.IGNORECASE)
+        raw = self._strip_media_ext(name)
         # 去掉推广域名前缀
         cleaned = self._PROMO_PREFIX_RE.sub("", raw).strip()
         # 去掉常见噪声标记
@@ -2092,4 +2343,3 @@ class P115AutoTransfer(_PluginBase):
         except Exception as e:
             logger.warning(f"【网盘整理】fs_dir_getid 失败 {path}: {e}")
             return None
-
