@@ -67,7 +67,7 @@
     "name": "缺集监测(自建)",
     "description": "定时监测 MP 订阅缺集，用 NextFind 搜索补全（支持 ed2k/115 拆包转存），转存后校验文件实际落地。NF 无资源时直接跳过，不做 PT 兜底。",
     "labels": "媒体管理",
-    "version": "2.1.1",
+    "version": "2.1.2",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/nextfind.png",
     "author": "local",
     "level": 1,
@@ -75,7 +75,8 @@
     "history": {
       "v2.0.0": "自建独立版：基于 NfMissingMonitor 2.0.0 复制，改 ID/类名/服务名，与上游脱钩",
       "v2.1.0": "新增跨通道去重：转存前查询 NF 转存历史，若该集已被 NF 自带「追更」等其它通道转存则跳过，避免同一集被两条通道重复转存、重复消耗配额（新增配置项 recent_dedup、dedup_scan_limit）",
-      "v2.1.1": "转存落地后的整理改为请求 P115AutoTransfer 定向整理（原 TransferChain().process() 不存在，实际未触发）"
+      "v2.1.1": "转存落地后的整理改为请求 P115AutoTransfer 定向整理（原 TransferChain().process() 不存在，实际未触发）",
+      "v2.1.2": "修正新版 MP 订阅对象无 tmdbid 属性导致缺集监测全部跳过（兼容 media_id/media_source）"
     }
   }
 }
