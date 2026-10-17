@@ -53,7 +53,7 @@ class P115AutoTransfer(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/115.png"
     # 插件版本
-    plugin_version = "1.17.0"
+    plugin_version = "1.17.1"
     # 插件作者
     plugin_author = "local"
     # 作者主页
@@ -1457,6 +1457,10 @@ class P115AutoTransfer(_PluginBase):
         for child in children:
             try:
                 if child.type != "dir":
+                    # 2026-10-17：115 提交离线未返回 info_hash 时（白名单为空），
+                    # 整包转存有时会把文件直接落在 /云下载 根目录而不是子目录，
+                    # 旧逻辑只扫描子目录，这类文件永远不会被整理。这里补上根目录散落文件。
+                    self._fallback_scan_loose_file(pan, child)
                     continue
                 # 去重：已处理过的目录不再重复整理
                 guard = f"dir:{Path(str(child.path)).name}"
@@ -1496,6 +1500,35 @@ class P115AutoTransfer(_PluginBase):
                 logger.error(f"【磁力离线】兜底扫描处理失败 {getattr(child, 'path', child)}: {e}",
                              exc_info=True)
 
+    def _fallback_scan_loose_file(self, pan, child) -> None:
+        """兜底整理 /云下载 根目录下的散落正片文件。
+
+        只处理「不是推广文件、体积不小于 min_file_size（未设置则 200MB）」的直属文件，
+        通过 ``offline_processed`` 的 ``file:<文件名>`` 标记去重。
+        """
+        try:
+            name = str(getattr(child, "name", "") or "")
+            if not name:
+                return
+            guard = f"file:{name}"
+            if self._is_task_processed(guard):
+                return
+            size = int(child.size or 0)
+            min_size = (self._min_file_size or 200) * 1024 * 1024
+            if size < min_size:
+                return
+            if self._is_promo_file(child.basename or name, size):
+                logger.debug(f"【磁力离线】兜底跳过推广文件：{child.path}")
+                return
+            logger.info(f"【磁力离线】兜底整理离线根目录散落文件：{child.path}")
+            self._process_finished_task({"name": name, "del_path": name})
+            self._mark_task_processed(guard)
+        except Exception as e:
+            logger.error(
+                f"【磁力离线】兜底处理散落文件失败 {getattr(child, 'path', child)}: {e}",
+                exc_info=True,
+            )
+
     def prune_offline_whitelist(self):
         """清理超过超时阈值仍未完成的离线任务白名单记录，避免长期膨胀。
 
@@ -1522,6 +1555,8 @@ class P115AutoTransfer(_PluginBase):
         rel = del_path.rstrip("/")
         src_path = f"{self._magnet_offline_dir.rstrip('/')}/{rel}"
         logger.info(f"【磁力离线】开始整理：{src_path}")
+        # 2026-10-17：散落在离线根目录的单文件，整理完不删除离线根目录本身
+        is_loose_file = "/" not in rel
 
         try:
             from app.modules.filemanager.storages.u115 import U115Pan
@@ -1611,7 +1646,9 @@ class P115AutoTransfer(_PluginBase):
             # 清理离线目录下遗留空目录
             self._cleanup_empty_dirs(pan)
             # 登记源目录复查（正片已移走，若只剩空文件夹则删除）
-            self._schedule_cleanup(src_path)
+            # 散落在离线根目录的单文件不登记，避免把 /云下载 本身当空目录删除
+            if not is_loose_file:
+                self._schedule_cleanup(src_path)
 
             # 成人内容：直接入库（绕过 MP 识别），并触发媒体服务器扫描
             library_path = final_path
