@@ -53,7 +53,7 @@ class P115AutoTransfer(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/115.png"
     # 插件版本
-    plugin_version = "1.16.1"
+    plugin_version = "1.17.0"
     # 插件作者
     plugin_author = "local"
     # 作者主页
@@ -1048,6 +1048,174 @@ class P115AutoTransfer(_PluginBase):
             self._handle_manual_transfer(event_data)
         elif action == "p115_offline_magnet":
             self._handle_offline_magnet(event_data)
+        elif action == "p115_target_transfer":
+            # 2026-10-17 新增：供其他插件（如 NextFind 控制器的 /nf）在转存成功后
+            # 定向整理刚落地的条目，整理完顺带清理源目录里的推广小文件。
+            self._handle_target_transfer(event_data)
+
+    def _handle_target_transfer(self, event_data: dict):
+        """处理定向整理请求：整理指定 TMDB ID 的新落地文件并清理源目录。"""
+        if not self._enabled:
+            logger.info("【网盘整理】插件未启用，忽略定向整理请求")
+            return
+        try:
+            data = event_data.get("data") if isinstance(event_data.get("data"), dict) else {}
+            tmdb_id = str(event_data.get("tmdb_id") or data.get("tmdb_id") or "").strip()
+            title = str(event_data.get("title") or data.get("title") or "").strip()
+            since = event_data.get("since") or data.get("since") or 0
+        except Exception:
+            tmdb_id, title, since = "", "", 0
+        if not tmdb_id:
+            logger.warning("【网盘整理】定向整理缺少 tmdb_id，参数：%s", event_data.get("arg_str"))
+            return
+        Thread(
+            target=self._run_target_transfer,
+            args=(tmdb_id, title, float(since or 0)),
+            daemon=True,
+            name="P115AutoTransfer-target-transfer",
+        ).start()
+
+    def _run_target_transfer(self, tmdb_id: str, title: str, since: float = 0):
+        """定向整理：找出目标媒体刚落地的视频文件整理，然后清理源目录。
+
+        - 只处理 ``/最近接收`` 下与该 TMDB ID 相关、且修改时间不早于本次转存的条目，
+          避免重复整理历史残留（推广小文件、已失败记录）。
+        - 整理后对该目录执行清理：已无正片则删小附件再删目录，仍有正片则只删小附件。
+        """
+        import time as _time
+
+        if not self._ensure_client():
+            return
+        root = self._manual_transfer_dir or "/最近接收"
+        deadline = _time.time() + 90
+        matched: List[FileItem] = []
+        while _time.time() < deadline:
+            try:
+                matched = self._scan_target_items(root, tmdb_id, since)
+            except Exception as e:
+                logger.error(f"【网盘整理】定向整理扫描失败 {root}: {e}", exc_info=True)
+                return
+            if matched:
+                break
+            sleep(5)
+        if not matched:
+            logger.info(f"【网盘整理】{title or tmdb_id} 90 秒内未发现可整理的新文件，跳过")
+            return
+        logger.info(f"【网盘整理】定向整理 {title or tmdb_id}：命中 {len(matched)} 个文件")
+        parents: List[str] = []
+        processed = self._target_seen_ids()
+        for fileitem, file_path in matched:
+            self._submit_transfer(fileitem, file_path)
+            if fileitem.fileid:
+                processed.add(str(fileitem.fileid))
+            parent = file_path.parent.as_posix()
+            if parent not in parents:
+                parents.append(parent)
+        try:
+            self.save_data("target_transfer_seen", list(processed)[-500:])
+        except Exception as e:
+            logger.warning(f"【网盘整理】记录定向整理文件失败: {e}")
+        # 清理前留出整理提交时间
+        sleep(max(10, min(60, int(self._transfer_interval_sec or 3) * len(matched) + 10)))
+        for parent in parents:
+            try:
+                self._cleanup_source_dir_with_junk(parent)
+            except Exception as e:
+                logger.warning(f"【网盘整理】定向清理 {parent} 失败: {e}", exc_info=True)
+
+    def _scan_target_items(self, root: str, tmdb_id: str, since: float) -> List[Tuple[FileItem, Path]]:
+        """扫描整理根目录，返回与目标 TMDB ID 匹配且属于本次转存的视频文件。"""
+        from p115client.tool.iterdir import iter_files
+
+        results: List[Tuple[FileItem, Path]] = []
+        cid = self._get_cid(root)
+        if cid is None or cid < 0:
+            return results
+        id_pattern = re.compile(rf"tmdb(?:id)?[=\-]\s*{re.escape(tmdb_id)}\b", re.IGNORECASE)
+        seen = self._target_seen_ids()
+        for item in iter_files(
+            self._client,
+            cid=int(cid),
+            with_path=True,
+            order="user_ptime",
+            max_workers=None,
+            with_ancestors=True,
+            cooldown=2,
+            use_media_api=False,
+        ):
+            try:
+                item_path = item.get("path")
+                if not item_path or item.get("is_dir"):
+                    continue
+                file_path = Path(str(item_path))
+                if not self._in_transfer_paths(file_path):
+                    continue
+                if not self._is_media_file(file_path):
+                    continue
+                if self._min_file_size and (item.get("size") or 0) < self._min_file_size * 1024 * 1024:
+                    continue
+                fid = str(item.get("id") or "")
+                if fid in seen:
+                    continue
+                mtime = item.get("ctime") or item.get("user_ptime") or 0
+                try:
+                    mtime = float(mtime)
+                except (TypeError, ValueError):
+                    mtime = 0.0
+                # 身份命中：文件路径或其祖先目录带该 TMDB ID；时间命中：本次转存后落地
+                identity_hit = bool(id_pattern.search(file_path.as_posix()))
+                if not identity_hit and (not since or mtime + 90 < since):
+                    continue
+                results.append((self._build_fileitem(item, file_path), file_path))
+            except Exception as e:
+                logger.error(f"【网盘整理】定向扫描条目失败: {e}", exc_info=True)
+        return results
+
+    def _target_seen_ids(self) -> set:
+        """读取已整理过的 fileid，避免同一文件被定向整理重复处理。"""
+        try:
+            data = self.get_data("target_transfer_seen") or []
+            return set(str(x) for x in data) if isinstance(data, list) else set()
+        except Exception:
+            return set()
+
+    def _cleanup_source_dir_with_junk(self, path: str):
+        """整理后清理源目录：无正片则删小附件与目录，仍有正片则只删小附件。"""
+        from app.modules.filemanager.storages.u115 import U115Pan
+
+        pan = U115Pan()
+        item = pan.get_item(Path(path))
+        if not item or item.type != "dir":
+            return
+        if self._is_protected_dir(item):
+            logger.debug(f"【网盘整理】{path} 为监控/离线根目录，跳过定向清理")
+            return
+        try:
+            children = pan.list(item) or []
+        except Exception as e:
+            logger.warning(f"【网盘整理】列目录失败，跳过定向清理 {path}: {e}")
+            return
+        video_ext = {ext.lower() for ext in settings.RMT_MEDIAEXT}
+        small_limit = 300 * 1024 * 1024
+        has_feature = any(
+            c.type != "dir"
+            and f".{(c.extension or '').lower()}" in video_ext
+            and (c.size or 0) >= small_limit
+            for c in children
+        )
+        if has_feature:
+            for c in children:
+                if c.type != "dir" and (c.size or 0) < small_limit:
+                    if pan.delete(c):
+                        logger.info(f"【网盘整理】已删除源目录小附件：{c.path}")
+            return
+        for c in children:
+            if c.type == "dir":
+                for sub in self._collect_child_files(pan, c):
+                    pan.delete(sub)
+            pan.delete(c)
+        if pan.delete(item):
+            logger.info(f"【网盘整理】已删除整理后源目录：{path}")
 
     @eventmanager.register(EventType.UserMessage)
     def on_user_message(self, event: Event = None):
