@@ -36,7 +36,7 @@ class MyNfMissingMonitor(_PluginBase):
     plugin_name = "缺集监测(自建)"
     plugin_desc = "定时监测 MP 订阅缺集，用 NextFind 搜索补全（支持 ed2k/115 拆包转存），转存后校验文件实际落地。NF 无资源时直接跳过，不做 PT 兜底。"
     plugin_icon = "nfmissingmonitor.png"
-    plugin_version = "2.1.3"
+    plugin_version = "2.1.4"
     plugin_label = "订阅,资源管理,智能体"
     plugin_author = "local"
     plugin_config_prefix = "mynfmissingmonitor_"
@@ -1299,6 +1299,20 @@ class MyNfMissingMonitor(_PluginBase):
             )
         return landed
 
+    def _p115_auto_transfer_active(self) -> bool:
+        """判断 115 网盘自动整理插件是否已启用。
+
+        读取该插件保存的配置（enabled 字段），不依赖宿主的私有运行态接口；
+        插件未安装或读取失败时返回 False，此时仍投递定向整理，保证单独使用时也能入库。
+        """
+        try:
+            conf = self.get_config("P115AutoTransfer")
+            if isinstance(conf, dict):
+                return bool(conf.get("enabled"))
+        except Exception as err:
+            logger.debug(f"读取 P115AutoTransfer 配置失败（按未启用处理）：{err}")
+        return False
+
     def _trigger_transfer(self, tmdb_id: Optional[str] = None, title: str = "") -> None:
         """转存落地后请求整理（115 为远程存储，需要主动触发）。
 
@@ -1308,6 +1322,14 @@ class MyNfMissingMonitor(_PluginBase):
         插件未安装/未启用时忽略即可，不影响转存结果。
         """
         if not self._auto_transfer:
+            return
+        # 2026-10-17：115 网盘自动整理已启用时，/最近接收 的生活事件与兜底轮询本就会整理，
+        # 再投递定向整理会造成重复准入（不会重复入库，但日志里会多一条失败记录）。
+        # 这里先判断一次，已启用则只记录日志，不再重复请求。
+        if self._p115_auto_transfer_active():
+            logger.info(
+                f"P115AutoTransfer 已启用，整理交给其常规监听：tmdb={tmdb_id} {title}"
+            )
             return
         try:
             eventmanager.send_event(
