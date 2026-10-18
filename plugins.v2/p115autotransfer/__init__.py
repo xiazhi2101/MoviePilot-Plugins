@@ -53,7 +53,7 @@ class P115AutoTransfer(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/115.png"
     # 插件版本
-    plugin_version = "1.17.1"
+    plugin_version = "1.17.3"
     # 插件作者
     plugin_author = "local"
     # 作者主页
@@ -88,6 +88,11 @@ class P115AutoTransfer(_PluginBase):
     # 目录事件待整理队列：目录路径 -> 登记时间（目录刚建时内部文件可能尚未落盘，需延迟复查）
     # 目录事件待整理队列：目录路径 -> (首次登记时间, 上次复查时间)
     _pending_folders: Dict[str, tuple] = {}
+    # 2026-10-18：批量整理缓冲（同一目录+同一季的文件合并成一次整理，只发一条入库通知）
+    _batch_lock = None
+    _batch_buffer: List[FileItem] = []
+    _batch_timer = None
+    _batch_window_sec = 8
 
     def __init__(self):
         super().__init__()
@@ -2144,8 +2149,8 @@ class P115AutoTransfer(_PluginBase):
         节流关闭时退化为原行为（同步直接提交）。
         """
         if not self._transfer_throttle_enabled:
-            TransferChain().do_transfer(fileitem=fileitem)
-            logger.info(f"【网盘整理】{file_path} 加入整理队列（节流已关闭，直接提交）")
+            self._buffer_batch(fileitem, file_path)
+            logger.info(f"【网盘整理】{file_path} 加入批量整理缓冲")
             return True
         fileid = str(fileitem.fileid or "")
         if fileid and fileid in self._queued_fileids:
@@ -2154,9 +2159,89 @@ class P115AutoTransfer(_PluginBase):
         self._ensure_transfer_worker()
         if fileid:
             self._queued_fileids.add(fileid)
-        self._transfer_queue.put((fileitem, str(file_path)))
-        logger.info(f"【网盘整理】{file_path} 已入整理队列（待提交 {self._transfer_queue.qsize()}）")
+        self._buffer_batch(fileitem, file_path)
+        logger.info(f"【网盘整理】{file_path} 已入批量整理缓冲（待提交 {self._transfer_queue.qsize()}）")
         return True
+
+    def _buffer_batch(self, fileitem: FileItem, file_path: Path) -> None:
+        """把整理任务放入批量缓冲，窗口结束或攒够后统一提交。
+
+        2026-10-18：MP 的整理失败/成功通知聚合以「一次 do_transfer 调用」为一个批次，
+        逐文件调用会逐条发送入库通知。这里把同一目录（同一季）的文件聚成一个窗口，
+        再一次性交给整理链，由 MP 自己合并成一条「已入库 N 个文件」的通知。
+        """
+        key = self._batch_key(file_path)
+        bucket = self._batch_buckets().setdefault(key, [])
+        bucket.append(fileitem)
+        logger.debug(f"【网盘整理】{file_path} 加入批量缓冲 {key}（当前 {len(bucket)}）")
+        if len(bucket) >= 50:
+            self._flush_batch(key)
+            return
+        timer = self._batch_timers.get(key)
+        if timer:
+            timer.cancel()
+        t = Timer(self._batch_window_sec, self._flush_batch, args=(key,))
+        t.daemon = True
+        t.start()
+        self._batch_timers[key] = t
+
+    def _batch_key(self, file_path: Path) -> str:
+        """批量分组键：同目录（通常即同一季）归为一组。"""
+        try:
+            return Path(file_path).parent.as_posix()
+        except Exception:
+            return ""
+
+    @classmethod
+    def _batch_buckets(cls) -> Dict[str, List[FileItem]]:
+        """返回批量缓冲桶（延迟初始化，插件重载后不残留旧对象）。"""
+        if getattr(cls, "_batch_buckets_store", None) is None:
+            cls._batch_buckets_store = {}
+            cls._batch_timers = {}
+        return cls._batch_buckets_store
+
+    def _flush_batch(self, key: str) -> None:
+        """把一个批量分组作为同一批次提交整理。
+
+        使用 ``selected_fileitems`` 把同季的多个文件放进**同一次**整理调用：
+        MP 的整理通知按调用批次聚合，因此只会发一条「已入库 N 个文件」。
+        """
+        buckets = self._batch_buckets()
+        items = buckets.pop(key, None) or []
+        timer = getattr(self, "_batch_timers", {}).pop(key, None)
+        if timer:
+            timer.cancel()
+        if not items:
+            return
+        chain = TransferChain()
+        if len(items) == 1:
+            try:
+                chain.do_transfer(fileitem=items[0])
+            except Exception as e:
+                logger.error(f"【网盘整理】提交整理失败 {items[0].path}: {e}", exc_info=True)
+            return
+        logger.info(f"【网盘整理】批量提交整理 {len(items)} 个文件（同批一条通知）：{key}")
+        try:
+            state, msg = chain.do_transfer(
+                fileitem=items[0],
+                selected_fileitems=items,
+            )
+            logger.info(f"【网盘整理】批量整理结果：{state} {str(msg)[:200]}")
+        except TypeError as e:
+            # 旧版本不支持 selected_fileitems：回退逐条提交
+            logger.warning(f"【网盘整理】批量整理接口不可用（{e}），回退逐条提交")
+            for item in items:
+                try:
+                    chain.do_transfer(fileitem=item)
+                except Exception as err:
+                    logger.error(f"【网盘整理】逐条整理失败 {item.path}: {err}", exc_info=True)
+        except Exception as e:
+            logger.error(f"【网盘整理】批量整理失败 {key}: {e}", exc_info=True)
+            for item in items:
+                try:
+                    chain.do_transfer(fileitem=item)
+                except Exception as err:
+                    logger.error(f"【网盘整理】回退逐条整理失败 {item.path}: {err}")
 
     def _ensure_transfer_worker(self):
         """确保串行提交线程已启动"""
@@ -2183,7 +2268,7 @@ class P115AutoTransfer(_PluginBase):
                 logger.error(f"【网盘整理】整理队列异常: {e}", exc_info=True)
                 continue
             try:
-                TransferChain().do_transfer(fileitem=fileitem)
+                self._buffer_batch(fileitem, Path(path))
                 logger.info(f"【网盘整理】{path} 已提交整理（剩余 {self._transfer_queue.qsize()}）")
             except Exception as e:
                 logger.error(f"【网盘整理】提交整理失败 {path}: {e}", exc_info=True)
@@ -2526,6 +2611,13 @@ class P115AutoTransfer(_PluginBase):
         m = self._CODE_RE.search(cleaned)
         if m:
             code = m.group(0).upper().replace("_", "-")
+            # 2026-10-17：只保留「前缀-数字」核心段，丢弃其后的补丁/修复标记。
+            # 例：ADN-388-RESTORED-1-PROB4 -> ADN-388；SSIS00123 -> SSIS-00123。
+            # 优先取最后一个「字母前缀-数字」段，避开 hhd800- 之类的片商前缀
+            cores = re.findall(r"([A-Z]{2,10})-(\d{2,6})", code)
+            if cores:
+                prefix, number = cores[-1]
+                return f"{prefix}-{number}"
             # 归一化：字母与数字之间补连字符（SSIS00123 -> SSIS-00123）
             code = re.sub(r"^([A-Z]+)(\d)", r"\1-\2", code)
             # 去掉末尾的 -U 标记（Uncensored 噪声）
