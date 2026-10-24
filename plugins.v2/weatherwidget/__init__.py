@@ -172,7 +172,7 @@ class WeatherWidget(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/InfinityPacer/MoviePilot-Plugins/main/icons/weatherwidget.png"
     # 插件版本
-    plugin_version = "3.5.0"
+    plugin_version = "3.6.0"
     # 插件作者
     plugin_author = "local"
     # 作者主页
@@ -1818,14 +1818,25 @@ class WeatherWidget(_PluginBase):
         :return: 通知标题；未配置城市时退回通用标题
         """
         location = str(self._location or "").strip()
-        if location:
-            # 按常见行政区划后缀切分，取最后一段作为城市名
-            city = re.split(r"省|自治区|市|地区|自治州|县|区", location)
-            city = next((part for part in reversed(city) if part), "")
-            if city:
-                return f"【实时天气】- {city}市"
-            return f"【实时天气】- {location}"
-        return "【实时天气】"
+        if not location:
+            return "【实时天气】"
+        # 按行政区划分层识别，避免把省级名称误当作市级
+        province = re.search(r"(.+?)(省|自治区|特别行政区)", location)
+        rest = location[province.end():] if province else location
+        city = re.search(r"(.+?)市", rest)
+        rest_after_city = rest[city.end():] if city else rest
+        district = re.search(r"(.+?)(区|县|旗)", rest_after_city)
+
+        city_name = city.group(1) if city else ""
+        district_name = district.group(1) if district else ""
+        if city_name and district_name:
+            # 同时有市与区时按「市 • 区」呈现，例如「咸阳 • 秦都」
+            return f"【实时天气】- {city_name} • {district_name}"
+        if district_name:
+            return f"【实时天气】- {district_name}{district.group(2)}"
+        if city_name:
+            return f"【实时天气】- {city_name}市"
+        return f"【实时天气】- {location}"
 
     def __resolve_notification_cover(self) -> Optional[str]:
         """
@@ -1961,7 +1972,9 @@ class WeatherWidget(_PluginBase):
             # 建议接在概述同一行，用分号连接，保持整体是一段话。
             advice = self.__resolve_travel_advice(now=now, daily=self._forecast_daily)
             if advice:
-                report_parts.append(f"\n{ABSTRACT_INDENT}{abstract.rstrip('。')}；{advice}")
+                report_parts.append(
+                    f"\n{ABSTRACT_INDENT}{abstract.rstrip('。')}；{self.__deduplicate_advice(abstract, advice)}"
+                )
             else:
                 report_parts.append(f"\n{ABSTRACT_INDENT}{abstract}")
 
@@ -2165,6 +2178,29 @@ class WeatherWidget(_PluginBase):
         return tips[0]
 
     @staticmethod
+    def __deduplicate_advice(abstract: str, advice: str) -> str:
+        """
+        避免出行建议与天气概述重复表达同一件事。
+
+        网页抓取的概述常已包含「空气较差」「有风」等描述，若建议再说一遍会显得啰嗦，
+        此时退回一句通用提示。
+
+        :param abstract: 天气概述文本
+        :param advice: 已生成的出行建议
+        :return: 去重后的建议文本
+        """
+        pairs = (
+            ("空气较差", ("空气较差", "空气一般", "空气质量")),
+            ("有风", ("风力较大",)),
+            ("雨", ("带伞", "路面湿滑")),
+            ("雪", ("带伞", "路面湿滑")),
+        )
+        for abstract_word, advice_words in pairs:
+            if abstract_word in abstract and any(word in advice for word in advice_words):
+                return "外出请根据天气变化合理安排行程。"
+        return advice
+
+    @staticmethod
     def __to_float(value: str) -> float:
         """把可能为数值字符串的内容安全转换为浮点数。
 
@@ -2277,7 +2313,8 @@ class WeatherWidget(_PluginBase):
                 advice = self.__resolve_travel_advice(now=web_now, daily=None)
                 if advice:
                     weather_report_parts.append(
-                        f"\n{ABSTRACT_INDENT}{abstract_text.rstrip('。')}；{advice}"
+                        f"\n{ABSTRACT_INDENT}{abstract_text.rstrip('。')}；"
+                        f"{self.__deduplicate_advice(abstract_text, advice)}"
                     )
                 else:
                     weather_report_parts.append(f"\n{ABSTRACT_INDENT}{abstract_text}")
